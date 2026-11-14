@@ -1,0 +1,23 @@
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Node (only used to build web/app.css from web/input.css)
+node_modules/
+
+# Generated at runtime — this is user data, not code, so it isn't committed.
+# Per-project audio output + saved PDF extractions:
+projects/
+# Legacy output folder from early versions:
+outputs/
+# Uploaded voice-clone samples (temporary):
+voices/*
+!voices/.gitkeep
+# Local test output:
+test.wav
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+*.log

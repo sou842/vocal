@@ -1,0 +1,16 @@
+{
+  "name": "vocal-studio",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i web/input.css -o web/app.css --minify",
+    "watch:css": "tailwindcss -i web/input.css -o web/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.5",
+    "tailwindcss": "^4.3.5"
+  },
+  "dependencies": {
+    "lucide": "^0.577.0"
+  }
+}

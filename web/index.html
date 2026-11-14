@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vocal Studio</title>
+<script>
+  // Apply theme + sidebar state before first paint (no flash)
+  try {
+    const r = document.documentElement, s = localStorage;
+    const t = s.getItem('theme');
+    if (t ? t === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches) r.classList.add('dark');
+    if (s.getItem('sbCollapsed') === '1') r.classList.add('sb-collapsed');
+    const w = parseInt(s.getItem('sbWidth'), 10);
+    if (w >= 200 && w <= 420) r.style.setProperty('--sb-w', w + 'px');
+  } catch (e) {}
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23262626'/%3E%3Cpath d='M7 13v6M12 9v14M17 6v20M22 10v12M27 13v6' stroke='white' stroke-width='2.4' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="min-h-screen text-sm">
+<div class="flex min-h-screen">
+
+  <!-- ============ Sidebar ============ -->
+  <div id="scrim" class="fixed inset-0 z-30 bg-black/50 md:hidden" hidden></div>
+  <aside id="sidebar" class="fixed inset-y-0 left-0 z-40 flex shrink-0 -translate-x-full flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-transform md:sticky md:top-0 md:h-screen md:translate-x-0">
+  <div class="sb-inner flex h-full min-h-0 flex-col">
+
+    <div class="flex h-14 shrink-0 items-center gap-2.5 overflow-hidden border-b border-sidebar-border px-4">
+      <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
+        <i data-lucide="audio-lines" class="size-4"></i>
+      </span>
+      <div class="sb-hide min-w-0 leading-tight">
+        <div class="truncate font-semibold tracking-tight">Vocal Studio</div>
+        <div class="truncate text-xs text-muted-foreground">Local text &amp; speech</div>
+      </div>
+    </div>
+
+    <!-- Project switcher -->
+    <div class="relative shrink-0 border-b border-sidebar-border p-3">
+      <div class="sb-hide">
+        <div class="mb-1.5 px-1 text-xs font-medium text-muted-foreground">Project</div>
+        <div class="flex gap-2">
+          <select id="project" class="input h-8 min-w-0 bg-background"></select>
+          <button id="newProjBtn" class="btn btn-outline btn-sm btn-icon size-8 shrink-0" title="New project" aria-label="New project">
+            <i data-lucide="plus"></i>
+          </button>
+        </div>
+        <form id="newProjForm" class="mt-2 flex gap-2" hidden>
+          <input id="newName" class="input h-8 min-w-0 bg-background" placeholder="e.g. Alfa" maxlength="40" autocomplete="off">
+          <button class="btn btn-primary btn-sm">Create</button>
+        </form>
+      </div>
+      <button id="projIcon" class="sb-only btn btn-outline btn-icon" style="left:14px;top:32px" title="Projects" aria-label="Expand sidebar to switch project">
+        <i data-lucide="folder-open"></i>
+      </button>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="flex-1 space-y-1 overflow-y-auto overflow-x-hidden p-3">
+      <div class="sb-hide mb-1.5 px-1 text-xs font-medium text-muted-foreground">Workspace</div>
+      <a class="nav-link" data-route="generate" title="Generate speech">
+        <i data-lucide="mic"></i><span class="sb-hide truncate">Generate speech</span>
+      </a>
+      <a class="nav-link" data-route="documents" title="Documents">
+        <i data-lucide="file-text"></i><span class="sb-hide truncate">Documents</span>
+        <span id="docCount" class="sb-hide ml-auto text-xs tabular-nums text-muted-foreground"></span>
+      </a>
+      <a class="nav-link" data-route="audio" title="Audio library">
+        <i data-lucide="music"></i><span class="sb-hide truncate">Audio library</span>
+        <span id="audioCount" class="sb-hide ml-auto text-xs tabular-nums text-muted-foreground"></span>
+      </a>
+    </nav>
+
+    <div class="relative shrink-0 border-t border-sidebar-border p-3">
+      <div class="sb-hide rounded-lg border bg-background p-3">
+        <div class="flex items-center gap-2 text-xs font-medium"><span id="jobDot" class="size-2 shrink-0 rounded-full bg-muted-foreground"></span><span id="jobText" class="truncate">Idle</span></div>
+        <div class="mt-1 hint">Runs locally on this computer.</div>
+      </div>
+      <span id="jobDot2" class="sb-only size-2.5 rounded-full bg-muted-foreground" style="left:27px;top:calc(50% - 5px)" title="Status"></span>
+    </div>
+
+  </div><!-- /sb-inner -->
+
+    <!-- Drag to resize (desktop, expanded only) -->
+    <div id="resizer" class="sb-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize · double-click to reset"></div>
+  </aside>
+
+  <!-- ============ Main ============ -->
+  <div class="flex min-w-0 flex-1 flex-col">
+    <header class="sticky top-0 z-20 flex h-14 items-center gap-3 border-b bg-background/95 px-4 backdrop-blur md:px-6">
+      <button id="menuBtn" class="btn btn-ghost btn-icon -ml-2 md:hidden" aria-label="Open menu"><i data-lucide="menu"></i></button>
+      <button id="collapseBtn" class="btn btn-ghost btn-icon -ml-2 hidden md:inline-flex" title="Collapse sidebar (Ctrl+B)" aria-label="Toggle sidebar"><i data-lucide="panel-left"></i></button>
+      <div class="hidden h-5 w-px bg-border md:block"></div>
+      <nav class="flex min-w-0 items-center gap-1.5 text-sm">
+        <span id="crumbProject" class="hidden truncate text-muted-foreground sm:inline"></span>
+        <i data-lucide="chevron-right" class="hidden size-3.5 text-muted-foreground sm:block"></i>
+        <span id="crumbPage" class="truncate font-medium"></span>
+      </nav>
+      <div class="ml-auto flex items-center gap-2">
+        <span id="badge" class="badge"><span class="size-1.5 rounded-full bg-current"></span><span id="badgeText">Ready</span></span>
+        <button id="themeBtn" class="btn btn-outline btn-icon" title="Toggle theme" aria-label="Toggle theme">
+          <i data-lucide="moon" class="dark:hidden"></i><i data-lucide="sun" class="hidden dark:block"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="mx-auto w-full max-w-6xl flex-1 p-4 md:p-6">
+
+      <!-- No project yet -->
+      <section id="view-empty" class="mx-auto mt-16 max-w-md text-center" hidden>
+        <div class="mx-auto mb-4 grid size-12 place-items-center rounded-xl border bg-muted">
+          <i data-lucide="folder-plus" class="size-6 text-muted-foreground"></i>
+        </div>
+        <h1 class="text-xl font-semibold tracking-tight">Create your first project</h1>
+        <p class="mt-1 text-muted-foreground">Projects keep audio and documents together. Audio files are named Project_1.wav, Project_2.wav...</p>
+        <form id="emptyForm" class="mt-6 flex gap-2">
+          <input id="emptyName" class="input" placeholder="Project name, e.g. Alfa" maxlength="40" autocomplete="off">
+          <button class="btn btn-primary">Create project</button>
+        </form>
+      </section>
+
+      <!-- ============ Generate ============ -->
+      <section id="view-generate" hidden>
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Generate speech</h1>
+          <p class="text-muted-foreground">Turn text into a .wav file. Output is saved to the current project.</p>
+        </div>
+
+        <div class="grid gap-4 lg:grid-cols-3">
+          <div class="card lg:col-span-2">
+            <div class="flex items-center justify-between p-5 pb-0">
+              <div>
+                <h2 class="font-semibold">Script</h2>
+                <p class="hint text-sm">Type, paste, or send text from a document.</p>
+              </div>
+              <button id="clearScript" class="btn btn-ghost btn-sm"><i data-lucide="eraser"></i>Clear</button>
+            </div>
+            <div class="p-5">
+              <textarea id="text" class="input h-auto min-h-72 resize-y py-2.5 leading-relaxed" placeholder="Enter your text here..."></textarea>
+              <div class="mt-2 flex justify-between hint"><span id="count">0 characters</span><span id="est">~0 s of audio</span></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="p-5 pb-0">
+              <h2 class="font-semibold">Voice settings</h2>
+              <p class="hint text-sm">Fine-tune how the voice sounds.</p>
+            </div>
+            <div class="space-y-5 p-5">
+              <div>
+                <div class="mb-2 flex justify-between"><label class="label" for="ex">Expressiveness</label><span id="exv" class="hint tabular-nums">0.50</span></div>
+                <input id="ex" type="range" min="0.25" max="1.5" step="0.05" value="0.5" class="w-full">
+                <p class="mt-1 hint">Higher is more dramatic, lower is calmer.</p>
+              </div>
+              <div>
+                <div class="mb-2 flex justify-between"><label class="label" for="cfg">Pace / adherence</label><span id="cfv" class="hint tabular-nums">0.50</span></div>
+                <input id="cfg" type="range" min="0" max="1" step="0.05" value="0.5" class="w-full">
+                <p class="mt-1 hint">Lower values give slower, more deliberate pacing.</p>
+              </div>
+              <div>
+                <div class="mb-2 flex justify-between"><label class="label" for="voice">Voice sample</label><span class="hint">Optional</span></div>
+                <input id="voice" type="file" accept=".wav,audio/wav" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
+                <p class="mt-1 hint">A clean ~10 second .wav clip to clone.</p>
+              </div>
+              <button id="go" class="btn btn-primary h-10 w-full"><i data-lucide="play"></i>Generate audio</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-4">
+          <div class="p-5 pb-0">
+            <h2 class="font-semibold">Output</h2>
+            <p class="hint text-sm">Progress and the finished file appear here.</p>
+          </div>
+          <div class="p-5">
+            <div class="mb-2.5 flex items-center justify-between gap-2">
+              <span id="status" class="text-muted-foreground">Waiting for a script.</span>
+              <span id="pct" class="hint tabular-nums"></span>
+            </div>
+            <div class="progress"><div id="prog" style="width:0"></div></div>
+            <div id="stats" class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4" hidden>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Completed</div><div id="sDone" class="text-lg font-semibold tabular-nums">0</div></div>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Pending</div><div id="sLeft" class="text-lg font-semibold tabular-nums">0</div></div>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Elapsed</div><div id="sEl" class="text-lg font-semibold tabular-nums">0:00</div></div>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Time left</div><div id="sEta" class="text-lg font-semibold tabular-nums">--</div></div>
+            </div>
+            <div id="parts" class="mt-4 max-h-56 overflow-auto rounded-lg border" hidden></div>
+            <div id="result"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ Documents list ============ -->
+      <section id="view-documents" hidden>
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Documents</h1>
+          <p class="text-muted-foreground">Extract text from PDFs. Extractions are saved, so each PDF only needs to be processed once.</p>
+        </div>
+
+        <div class="card p-5">
+          <label id="drop" class="flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border-[1.5px] border-dashed border-input bg-muted px-4 py-9 text-center transition-colors hover:border-ring hover:bg-accent">
+            <input id="pdfFile" type="file" accept="application/pdf,.pdf" hidden>
+            <i data-lucide="file-up" class="size-8 text-muted-foreground"></i>
+            <div class="font-medium">Drop a PDF here, or <u>browse</u></div>
+            <div class="hint">Headings, lists, tables and columns are preserved. Page headers and footers are removed.</div>
+          </label>
+          <div id="exProg" class="mt-1" hidden>
+            <div class="mb-2.5 flex items-center justify-between gap-2">
+              <span id="exStatus" class="text-muted-foreground">Uploading...</span>
+              <span id="exPct" class="hint tabular-nums"></span>
+            </div>
+            <div class="progress"><div id="exBar" style="width:0"></div></div>
+            <div id="exMeta" class="mt-2 hint"></div>
+          </div>
+        </div>
+
+        <div class="card mt-4">
+          <div class="flex flex-wrap items-center justify-between gap-3 p-5 pb-3">
+            <div>
+              <h2 class="font-semibold">Saved documents</h2>
+              <p class="hint text-sm">Click a document to open it. Your edits are saved automatically.</p>
+            </div>
+            <div class="relative w-full sm:w-64">
+              <i data-lucide="search" class="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"></i>
+              <input id="docFilter" class="input pl-8" placeholder="Filter documents..." autocomplete="off">
+            </div>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="border-y bg-muted/50 text-left text-xs text-muted-foreground">
+                <tr>
+                  <th class="px-5 py-2.5 font-medium">Name</th>
+                  <th class="px-3 py-2.5 text-right font-medium">Pages</th>
+                  <th class="hidden px-3 py-2.5 text-right font-medium sm:table-cell">Words</th>
+                  <th class="hidden px-3 py-2.5 font-medium md:table-cell">Added</th>
+                  <th class="px-5 py-2.5"></th>
+                </tr>
+              </thead>
+              <tbody id="docRows"></tbody>
+            </table>
+          </div>
+          <div id="docEmpty" class="px-5 py-10 text-center text-muted-foreground" hidden>No documents yet. Upload a PDF above.</div>
+        </div>
+      </section>
+
+      <!-- ============ Document viewer ============ -->
+      <section id="view-doc" hidden>
+        <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <button id="backDocs" class="btn btn-ghost btn-sm -ml-3 mb-1"><i data-lucide="chevron-left"></i>All documents</button>
+            <h1 id="docName" class="truncate text-2xl font-semibold tracking-tight"></h1>
+            <p id="docMeta" class="text-muted-foreground"></p>
+          </div>
+          <span id="saveState" class="badge mt-8"></span>
+        </div>
+
+        <div class="card sticky top-16 z-10 mb-4 space-y-3 p-3 md:p-4">
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="relative min-w-48 flex-1 sm:max-w-sm">
+              <i data-lucide="search" class="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"></i>
+              <input id="exSearch" class="input pl-8" placeholder="Search in document..." autocomplete="off">
+            </div>
+            <label class="inline-flex cursor-pointer select-none items-center gap-2 text-sm font-medium">
+              <input id="cleanOn" type="checkbox" class="peer sr-only" checked>
+              <span class="relative h-5 w-9 rounded-full bg-input transition-colors after:absolute after:left-0.5 after:top-0.5 after:size-4 after:rounded-full after:bg-background after:shadow after:transition-transform peer-checked:bg-primary peer-checked:after:translate-x-4"></span>
+              Clean for speech
+            </label>
+            <div class="ml-auto flex gap-1.5">
+              <button id="selAll" class="btn btn-ghost btn-sm"><i data-lucide="check-check"></i>Select all</button>
+              <button id="selNone" class="btn btn-ghost btn-sm"><i data-lucide="x"></i>Clear</button>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-1.5">
+            <button id="copySel" class="btn btn-outline btn-sm"><i data-lucide="copy"></i>Copy</button>
+            <button id="dlMd" class="btn btn-outline btn-sm"><i data-lucide="download"></i>.md</button>
+            <button id="dlTxt" class="btn btn-outline btn-sm"><i data-lucide="download"></i>.txt</button>
+            <button id="saveProj" class="btn btn-outline btn-sm"><i data-lucide="save"></i>Save text to project</button>
+            <button id="sendSel" class="btn btn-primary btn-sm ml-auto"><i data-lucide="arrow-right"></i>Send to Script</button>
+          </div>
+          <div id="selInfo" class="hint"></div>
+        </div>
+
+        <div class="grid items-start gap-4 lg:grid-cols-[200px_minmax(0,1fr)]">
+          <aside class="card sticky top-[17rem] hidden max-h-[calc(100vh-18rem)] overflow-auto p-2 lg:block">
+            <div class="px-2 pb-2 pt-1 text-[11px] uppercase tracking-wide text-muted-foreground">Pages</div>
+            <div id="exNav"></div>
+          </aside>
+          <div id="exPages"></div>
+        </div>
+      </section>
+
+      <!-- ============ Audio library ============ -->
+      <section id="view-audio" hidden>
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Audio library</h1>
+          <p class="text-muted-foreground">Every file generated in this project, newest first.</p>
+        </div>
+        <div class="card">
+          <div id="audioList" class="divide-y"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div id="toast" class="pointer-events-none fixed bottom-6 left-1/2 z-50 max-w-[calc(100vw-2rem)] -translate-x-1/2 translate-y-4 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground opacity-0 shadow-lg transition-all"></div>
+
+<script src="/lucide.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
