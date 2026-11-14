@@ -419,11 +419,11 @@ function renderDocRows(){
   $('docEmpty').textContent = docsCache.length ? 'No documents match your filter.' : 'No documents yet. Upload a PDF above.';
   $('docRows').innerHTML = rows.map(d => `
     <tr class="cursor-pointer border-b last:border-b-0 hover:bg-muted/50" data-id="${esc(d.id)}" tabindex="0">
-      <td class="px-5 py-3">
+      <td class="max-w-0 px-5 py-3">
         <div class="flex items-center gap-3">
           <span class="grid size-8 shrink-0 place-items-center rounded-md border bg-muted text-muted-foreground [&_svg]:size-4">${ICON.doc}</span>
           <div class="min-w-0">
-            <div class="truncate font-medium">${esc(d.name)}</div>
+            <div class="truncate font-medium" title="${esc(d.name)}">${esc(d.name)}</div>
             ${d.edited ? `<div class="hint">${esc(d.edited)} page(s) edited</div>` : ''}
           </div>
         </div>
