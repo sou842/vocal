@@ -70,6 +70,11 @@
         <i data-lucide="music"></i><span class="sb-hide truncate">Audio library</span>
         <span id="audioCount" class="sb-hide ml-auto text-xs tabular-nums text-muted-foreground"></span>
       </a>
+      <div class="sb-hide mb-1.5 mt-4 px-1 text-xs font-medium text-muted-foreground">System</div>
+      <a class="nav-link" data-route="settings" title="Settings">
+        <i data-lucide="settings"></i><span class="sb-hide truncate">Settings</span>
+        <span id="engineTag" class="sb-hide ml-auto rounded-full border px-1.5 text-[10px] font-medium text-muted-foreground"></span>
+      </a>
     </nav>
 
     <div class="relative shrink-0 border-t border-sidebar-border p-3">
@@ -98,6 +103,9 @@
         <span id="crumbPage" class="truncate font-medium"></span>
       </nav>
       <div class="ml-auto flex items-center gap-2">
+        <a id="engPill" href="#/settings" class="badge hover:bg-accent" role="status" title="Speech engine">
+          <span id="engDot" class="size-1.5 rounded-full bg-current"></span><span id="engText" class="hidden sm:inline">Local CPU</span>
+        </a>
         <span id="badge" class="badge"><span class="size-1.5 rounded-full bg-current"></span><span id="badgeText">Ready</span></span>
         <button id="themeBtn" class="btn btn-outline btn-icon" title="Toggle theme" aria-label="Toggle theme">
           <i data-lucide="moon" class="dark:hidden"></i><i data-lucide="sun" class="hidden dark:block"></i>
@@ -149,19 +157,26 @@
             </div>
             <div class="space-y-5 p-5">
               <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="ex">Expressiveness</label><span id="exv" class="hint tabular-nums">0.50</span></div>
-                <input id="ex" type="range" min="0.25" max="1.5" step="0.05" value="0.5" class="w-full">
+                <div class="mb-2 flex justify-between"><label class="label" for="ex">Expressiveness</label><span id="exv" class="hint tabular-nums">0.55</span></div>
+                <input id="ex" type="range" min="0.25" max="1.5" step="0.05" value="0.55" class="w-full">
                 <p class="mt-1 hint">Higher is more dramatic, lower is calmer.</p>
               </div>
               <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="cfg">Pace / adherence</label><span id="cfv" class="hint tabular-nums">0.50</span></div>
-                <input id="cfg" type="range" min="0" max="1" step="0.05" value="0.5" class="w-full">
+                <div class="mb-2 flex justify-between"><label class="label" for="cfg">Pace / adherence</label><span id="cfv" class="hint tabular-nums">0.45</span></div>
+                <input id="cfg" type="range" min="0" max="1" step="0.05" value="0.45" class="w-full">
                 <p class="mt-1 hint">Lower values give slower, more deliberate pacing.</p>
               </div>
               <div>
                 <div class="mb-2 flex justify-between"><label class="label" for="voice">Voice sample</label><span class="hint">Optional</span></div>
                 <input id="voice" type="file" accept=".wav,audio/wav" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
                 <p class="mt-1 hint">A clean ~10 second .wav clip to clone.</p>
+              </div>
+              <div class="flex items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+                <span class="flex min-w-0 items-center gap-2">
+                  <i data-lucide="cpu" class="size-3.5 shrink-0 text-muted-foreground"></i>
+                  <span class="truncate">Engine: <b id="engineName">Local CPU</b> <span id="engineState" class="text-muted-foreground"></span></span>
+                </span>
+                <a href="#/settings" class="shrink-0 font-medium underline underline-offset-2">Change</a>
               </div>
               <button id="go" class="btn btn-primary h-10 w-full"><i data-lucide="play"></i>Generate audio</button>
             </div>
@@ -298,6 +313,80 @@
         </div>
         <div class="card">
           <div id="audioList" class="divide-y"></div>
+        </div>
+      </section>
+
+      <!-- ============ Settings ============ -->
+      <section id="view-settings" hidden>
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+          <p class="text-muted-foreground">Choose where speech is generated. Everything else always runs on this computer.</p>
+        </div>
+
+        <div class="grid items-start gap-4 lg:grid-cols-3">
+          <form id="settingsForm" class="card lg:col-span-2" autocomplete="off">
+            <div class="p-5 pb-0">
+              <h2 class="font-semibold">Speech engine</h2>
+              <p class="hint text-sm">Used for new generations. Jobs already running keep the engine they started with.</p>
+            </div>
+            <div class="space-y-5 p-5">
+              <div class="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="Speech engine">
+                <label class="engine-opt flex cursor-pointer gap-3 rounded-lg border p-4 transition-colors hover:bg-accent has-[:checked]:border-ring has-[:checked]:bg-accent">
+                  <input type="radio" name="engine" value="local" class="mt-1 size-4 shrink-0">
+                  <span>
+                    <span class="flex items-center gap-2 font-medium"><i data-lucide="cpu" class="size-4"></i>Local CPU</span>
+                    <span class="mt-1 block hint">Runs on this computer and works offline. Slow on this machine: about 15–25× longer than the audio.</span>
+                  </span>
+                </label>
+                <label class="engine-opt flex cursor-pointer gap-3 rounded-lg border p-4 transition-colors hover:bg-accent has-[:checked]:border-ring has-[:checked]:bg-accent">
+                  <input type="radio" name="engine" value="colab" class="mt-1 size-4 shrink-0">
+                  <span>
+                    <span class="flex items-center gap-2 font-medium"><i data-lucide="zap" class="size-4"></i>Colab GPU</span>
+                    <span class="mt-1 block hint">Runs on a Google Colab GPU. Much faster, but the Colab notebook must be running.</span>
+                  </span>
+                </label>
+              </div>
+
+              <div id="colabFields" class="space-y-4 rounded-lg border p-4">
+                <div>
+                  <label class="label" for="colabUrl">Colab address</label>
+                  <input id="colabUrl" class="input mt-2 font-mono text-xs" placeholder="https://xxxx-xxxx.trycloudflare.com" spellcheck="false">
+                  <p class="mt-1 hint">Printed as <b>Address</b> by the notebook. It changes every Colab session.</p>
+                </div>
+                <div>
+                  <label class="label" for="colabKey">Access key</label>
+                  <div class="mt-2 flex gap-2">
+                    <input id="colabKey" type="password" class="input font-mono text-xs" spellcheck="false">
+                    <button type="button" id="toggleKey" class="btn btn-outline btn-icon shrink-0" title="Show / hide key" aria-label="Show or hide key"><i data-lucide="eye"></i></button>
+                  </div>
+                  <p id="keyHint" class="mt-1 hint">Printed as <b>Key</b> by the notebook. It is stored only on this computer.</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                  <button type="button" id="testColab" class="btn btn-outline btn-sm"><i data-lucide="plug-zap"></i>Test connection</button>
+                  <span id="testResult" class="text-sm" role="status"></span>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-end gap-3">
+                <span id="saveResult" class="text-sm" role="status"></span>
+                <button type="submit" id="saveSettings" class="btn btn-primary"><i data-lucide="save"></i>Save settings</button>
+              </div>
+            </div>
+          </form>
+
+          <div class="card">
+            <div class="p-5 pb-0">
+              <h2 class="font-semibold">Start the Colab worker</h2>
+              <p class="hint text-sm">Needed each time you use Colab GPU.</p>
+            </div>
+            <ol class="list-decimal space-y-2.5 p-5 pl-9 text-sm marker:text-muted-foreground">
+              <li>Open <a class="underline underline-offset-2" href="https://colab.research.google.com" target="_blank" rel="noopener">Google Colab</a> → <b>File → Upload notebook</b> → choose <code class="rounded bg-muted px-1 text-xs">colab/vocal_worker.ipynb</code> from this app's folder.</li>
+              <li><b>Runtime → Change runtime type → T4 GPU</b>.</li>
+              <li><b>Runtime → Run all</b>. The first run installs packages (a few minutes).</li>
+              <li>When it prints <b>READY</b>, copy the <b>Address</b> and <b>Key</b> here, then <b>Test connection</b> and <b>Save</b>.</li>
+              <li>Keep the Colab tab open while generating.</li>
+            </ol>
+          </div>
         </div>
       </section>
     </main>

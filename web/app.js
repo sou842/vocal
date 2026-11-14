@@ -210,8 +210,8 @@ async function refreshCounts(){
 }
 
 /* ================================================================ router */
-const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio'];
-const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library'};
+const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'settings'];
+const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', settings: 'Settings'};
 function show(view){
   VIEWS.forEach(v => { $('view-' + v).hidden = v !== view; });
   const nav = view === 'doc' ? 'documents' : view;
@@ -227,10 +227,11 @@ function route(){
   if (!curProject()){ show('empty'); $('crumbPage').textContent = 'Get started'; return; }
   const h = currentRoute();
   if (h.startsWith('doc/')){ show('doc'); openDoc(h.slice(4)); return; }
-  const v = ['generate', 'documents', 'audio'].includes(h) ? h : 'generate';
+  const v = ['generate', 'documents', 'audio', 'settings'].includes(h) ? h : 'generate';
   show(v);
   if (v === 'documents') loadDocs();
   if (v === 'audio') loadAudio();
+  if (v === 'settings') loadSettings(true);
 }
 document.querySelectorAll('.nav-link').forEach(a => {
   a.href = '#/' + a.dataset.route;   // real links: keyboard focusable, middle-click works
@@ -343,7 +344,7 @@ async function pollTts(id){
     if (j.status === 'done'){
       $('prog').style.width = '100%'; $('pct').textContent = '100%';
       if (j.total){ j.done = j.total; j.eta = 0; renderDetails(j); }
-      setStatus(`Finished. ${j.seconds} seconds of audio saved as ${j.file} in project ${j.project}.`);
+      setStatus(`Finished${j.took != null ? ' in ' + fmt(j.took) : ''} on ${engineLabel(j)}. ${j.seconds} seconds of audio saved as ${j.file} in project ${j.project}.`);
       setBadge('ok', 'Done'); setJob('tts', null);
       showResult(j.project, j.file, j.seconds);
       setBusy(false); refreshCounts(); toast('Saved ' + j.file);
@@ -352,17 +353,22 @@ async function pollTts(id){
     }
     if (j.status === 'error'){
       setStatus(j.error || 'Generation failed.', true); setBadge('err', 'Error');
+      if (j.remoteFailed){ showRemoteFallback(); checkColab(); }
       setJob('tts', null); setBusy(false); ttsPollId = null; return;
     }
     if (j.total){
       const pct = Math.round(j.done / j.total * 100);
       $('prog').style.width = pct + '%'; $('pct').textContent = pct + '%';
-      setStatus(`Generating part ${Math.min(j.done + 1, j.total)} of ${j.total}. This can take a while on CPU.`);
+      setStatus(`Generating part ${Math.min(j.done + 1, j.total)} of ${j.total} on ${engineLabel(j)}.` +
+        (j.engine === 'colab' ? '' : ' This can take a while on CPU.'));
       setJob('tts', `Generating ${j.done}/${j.total} parts`);
       renderDetails(j);
     } else {
-      setStatus(j.status === 'queued' ? 'Queued...' : 'Loading the voice model. The first run takes longer.');
-      setJob('tts', j.status === 'queued' ? 'Queued' : 'Loading model');
+      const msg = {queued: ['Queued...', 'Queued'],
+                   connecting: ['Connecting to the Colab GPU...', 'Connecting to Colab'],
+                   'loading model': ['Loading the voice model. The first run takes longer.', 'Loading model']}[j.status]
+                  || ['Working...', 'Working'];
+      setStatus(msg[0]); setJob('tts', msg[1]);
     }
     await sleep(1500);
   }
@@ -384,19 +390,31 @@ async function loadAudio(){
   box.innerHTML = files.map(f => `
     <div class="p-4 md:px-5" data-file="${esc(f)}">
       <div class="flex items-center gap-3">
-        <span class="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted [&_svg]:size-4">${ICON.play}</span>
+        <button class="grid size-9 shrink-0 cursor-pointer place-items-center rounded-lg border bg-muted transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-4" data-play data-ico title="Play" aria-label="Play ${esc(f)}">${ICON.play}</button>
         <span class="flex-1 truncate font-mono text-xs">${esc(f)}</span>
-        <button class="btn btn-outline btn-sm" data-play>Play</button>
+        <button class="btn btn-outline btn-sm" data-play data-lbl>Play</button>
         <a class="btn btn-outline btn-sm" href="${audioUrl(p, f)}" download>${ICON.dl}<span class="hidden sm:inline">Download</span></a>
       </div>
     </div>`).join('');
+  const setRowState = (row, playing) => {
+    row.querySelector('[data-ico]').innerHTML = playing ? lu('pause') : lu('play');
+    row.querySelector('[data-ico]').title = playing ? 'Pause' : 'Play';
+    row.querySelector('[data-lbl]').textContent = playing ? 'Pause' : 'Play';
+  };
   box.querySelectorAll('[data-play]').forEach(b => b.onclick = () => {
     const row = b.closest('[data-file]');
-    if (row.querySelector('audio')) return;
-    box.querySelectorAll('audio').forEach(x => { x.pause(); x.remove(); });
-    const a = document.createElement('audio');
+    let a = row.querySelector('audio');
+    if (a){ if (a.paused) a.play().catch(() => {}); else a.pause(); return; }   // same row: toggle
+    box.querySelectorAll('[data-file]').forEach(r => {                           // another row: stop it
+      const x = r.querySelector('audio');
+      if (x){ x.pause(); x.remove(); setRowState(r, false); }
+    });
+    a = document.createElement('audio');
     a.controls = true; a.autoplay = true; a.className = 'mt-3 w-full';
     a.src = audioUrl(p, row.dataset.file);
+    a.addEventListener('play', () => setRowState(row, true));
+    a.addEventListener('pause', () => setRowState(row, false));
+    a.addEventListener('ended', () => setRowState(row, false));
     row.appendChild(a);
   });
 }
@@ -808,6 +826,121 @@ $('exSearch').oninput = () => {
   autosizeAll();   // pages that were hidden may have stale heights
 };
 
+/* ================================================================ settings: speech engine (Local CPU / Colab GPU) */
+let settings = {engine: 'local', colab_url: '', has_key: false};
+const engineLabel = j => j.engine === 'colab' ? 'Colab GPU' + (j.gpu ? ` (${j.gpu})` : '') : 'Local CPU';
+
+async function loadSettings(fillForm){
+  try { settings = await api.get('/api/settings'); }
+  catch (e){ if (fillForm) showError(e); return; }
+  renderEngine();
+  if (fillForm) fillSettingsForm();
+}
+function renderEngine(){
+  const colab = settings.engine === 'colab';
+  $('engineName').textContent = colab ? 'Colab GPU' : 'Local CPU';
+  $('engineTag').textContent = colab ? 'GPU' : 'CPU';
+  checkColab();
+}
+
+/* Live connection state, shown in the header pill and on the Generate page.
+   Checked every 15 s while the tab is visible, when you return to the tab, and after settings/job changes. */
+const PILL = {
+  local:    {cls: 'badge hover:bg-accent', text: 'Local CPU', pulse: false},
+  checking: {cls: 'badge hover:bg-accent', text: 'Colab GPU · Checking...', pulse: true},
+  online:   {cls: 'badge hover:bg-accent text-success border-success/40', text: 'Colab GPU · Connected', pulse: false},
+  offline:  {cls: 'badge hover:bg-accent text-destructive border-destructive/40', text: 'Colab GPU · Offline', pulse: false},
+};
+let colabState = 'local', colabCheckSeq = 0, colabLoaded = false;
+function showEngineState(state, title, stateText){
+  colabState = state;
+  const p = PILL[state];
+  $('engPill').className = p.cls;
+  $('engText').textContent = p.text;
+  $('engDot').className = 'size-1.5 rounded-full bg-current' + (p.pulse ? ' animate-pulse' : '');
+  $('engPill').title = title || 'Speech engine';
+  $('engineState').textContent = stateText || '';
+}
+async function checkColab(){
+  const seq = ++colabCheckSeq;
+  if (settings.engine !== 'colab'){ colabLoaded = false; showEngineState('local', 'Speech runs on this computer'); return; }
+  if (!colabLoaded) showEngineState('checking', 'Checking the Colab connection...', '· checking...');   // only the first time: no flicker on later polls
+  let r;
+  try { r = await api.get('/api/colab/status'); }
+  catch (e){ if (seq === colabCheckSeq) showEngineState('offline', e.message, '· offline'); return; }
+  if (seq !== colabCheckSeq) return;   // a newer check superseded this one
+  colabLoaded = true;
+  if (r.engine !== 'colab'){ showEngineState('local', 'Speech runs on this computer'); return; }
+  if (r.connected){
+    const gpu = r.device === 'cuda' ? (r.gpu || 'GPU') : 'CPU only - no GPU in the Colab runtime!';
+    showEngineState('online', `Connected to Colab: ${gpu} · ${r.latency_ms} ms`, '· connected');
+  } else {
+    showEngineState('offline', r.error || 'Cannot reach the Colab worker.', '· offline');
+  }
+}
+setInterval(() => { if (!document.hidden && settings.engine === 'colab') checkColab(); }, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && settings.engine === 'colab') checkColab(); });
+function selectedEngine(){ return (document.querySelector('input[name="engine"]:checked') || {}).value || 'local'; }
+function updateColabFields(){
+  $('colabFields').classList.toggle('opacity-60', selectedEngine() !== 'colab');
+}
+function fillSettingsForm(){
+  document.querySelectorAll('input[name="engine"]').forEach(r => { r.checked = r.value === settings.engine; });
+  $('colabUrl').value = settings.colab_url || '';
+  $('colabKey').value = '';
+  $('colabKey').placeholder = settings.has_key ? 'Saved (leave empty to keep it)' : 'Paste the Key from the notebook';
+  $('testResult').textContent = ''; $('saveResult').textContent = '';
+  updateColabFields();
+}
+const setResult = (id, text, kind) => {
+  $(id).textContent = text;
+  $(id).className = 'text-sm ' + ({ok: 'text-success', err: 'text-destructive'}[kind] || 'text-muted-foreground');
+};
+document.querySelectorAll('input[name="engine"]').forEach(r => r.addEventListener('change', updateColabFields));
+$('toggleKey').onclick = () => { const k = $('colabKey'); k.type = k.type === 'password' ? 'text' : 'password'; };
+
+$('testColab').onclick = async () => {
+  const btn = $('testColab');
+  btn.disabled = true; setResult('testResult', 'Testing...');
+  try {
+    const r = await api.post('/api/colab/test', {colab_url: $('colabUrl').value.trim(), colab_key: $('colabKey').value.trim()});
+    if (r.ok) setResult('testResult', `Connected: ${r.device === 'cuda' ? (r.gpu || 'GPU') : 'CPU only (no GPU in Colab!)'} · ${r.latency_ms} ms`, r.device === 'cuda' ? 'ok' : 'err');
+    else setResult('testResult', r.error, 'err');
+  } catch (e){ setResult('testResult', e.message, 'err'); }
+  btn.disabled = false;
+};
+
+$('settingsForm').onsubmit = async e => {
+  e.preventDefault();
+  const btn = $('saveSettings');
+  btn.disabled = true; setResult('saveResult', 'Saving...');
+  try {
+    settings = await api.post('/api/settings', {engine: selectedEngine(), colab_url: $('colabUrl').value.trim(), colab_key: $('colabKey').value.trim()});
+    colabLoaded = false;   // new address/key: show "Checking..." instead of the old state
+    renderEngine(); fillSettingsForm();
+    setResult('saveResult', 'Saved. New generations use ' + (settings.engine === 'colab' ? 'Colab GPU.' : 'Local CPU.'), 'ok');
+  } catch (err){ setResult('saveResult', err.message, 'err'); }
+  btn.disabled = false;
+};
+
+/* Offered on the Generate page when the Colab worker fails mid-job. */
+function showRemoteFallback(){
+  $('result').innerHTML = `
+    <div class="mt-5 flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 p-4">
+      <span class="flex-1 text-sm">Colab GPU is not available right now. Restart the notebook and update the Address in Settings, or use this computer instead.</span>
+      <a class="btn btn-outline btn-sm" href="#/settings">${lu('settings')}Open Settings</a>
+      <button class="btn btn-primary btn-sm" id="useLocal">${lu('cpu')}Switch to Local CPU</button>
+    </div>`;
+  $('useLocal').onclick = async () => {
+    try {
+      settings = await api.post('/api/settings', {engine: 'local'});
+      renderEngine(); $('result').innerHTML = '';
+      setStatus('Switched to Local CPU. Click Generate audio to try again.');
+      setBadge('', 'Ready');
+    } catch (e){ showError(e); }
+  };
+}
+
 /* ================================================================ re-attach to running jobs after a reload */
 async function resumeActiveJobs(){
   let a;
@@ -828,4 +961,5 @@ async function resumeActiveJobs(){
 
 /* ================================================================ start */
 updateCount();
+loadSettings();
 loadProjects().then(resumeActiveJobs);

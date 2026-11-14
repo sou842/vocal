@@ -15,6 +15,7 @@ this app's own origin with the expected Content-Type (blocks other websites post
 import base64
 import binascii
 import hashlib
+import io
 import json
 import os
 import queue
@@ -23,12 +24,15 @@ import shutil
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+import wave
 import webbrowser
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+import numpy as np
 import torch
 import torchaudio as ta
 
@@ -46,7 +50,11 @@ MAX_SCRIPT_CHARS = 500_000
 CHUNK_CHARS = 150                      # text per TTS call; smaller = finer progress
 JOB_TTL_SECONDS = 3600                 # finished jobs are forgotten after this
 
+REMOTE_TIMEOUT = 150                   # seconds per remote request (one ~150-char part on a GPU takes a few s)
+REMOTE_RETRIES = 3                     # attempts per part on network errors / 5xx
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(ROOT, "settings.json")   # local only, git-ignored (holds the Colab key)
 WEB = os.path.join(ROOT, "web")
 PROJECTS = os.path.join(ROOT, "projects")
 VOICES = os.path.join(ROOT, "voices")  # temporary uploaded voice samples (deleted after each job)
@@ -117,8 +125,8 @@ def next_audio_name(project):
 state_lock = threading.RLock()    # guards tts_jobs / ext_jobs and every job dict inside them
 tts_jobs, ext_jobs = {}, {}
 tts_q, ext_q = queue.Queue(), queue.Queue()
-PRIVATE_KEYS = {"text", "voice", "data", "t0"}
-ACTIVE = {"queued", "loading model", "generating", "extracting"}
+PRIVATE_KEYS = {"text", "voice", "data", "t0", "remote"}
+ACTIVE = {"queued", "loading model", "connecting", "generating", "extracting"}
 
 
 def job_update(job, **fields):
@@ -143,6 +151,145 @@ def prune_jobs():
                 del table[jid]
 
 
+# ------------------------------------------------------------------ settings (speech engine)
+settings_lock = threading.Lock()
+ENGINES = {"local", "colab"}
+DEFAULT_SETTINGS = {"engine": "local", "colab_url": "", "colab_key": ""}
+
+
+def load_settings():
+    with settings_lock:
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+    s = dict(DEFAULT_SETTINGS)
+    s.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS and isinstance(v, str)})
+    if s["engine"] not in ENGINES:
+        s["engine"] = "local"
+    return s
+
+
+def save_settings(s):
+    with settings_lock:
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(s, fh, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+
+
+def public_settings(s):
+    """Settings as the browser sees them: the key itself never leaves the server."""
+    return {"engine": s["engine"], "colab_url": s["colab_url"], "has_key": bool(s["colab_key"])}
+
+
+def normalize_url(url):
+    url = str(url or "").strip().rstrip("/")
+    if url and not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[^\s]*)?", url):
+        raise ApiError(400, "The Colab address should look like https://something.trycloudflare.com")
+    return url
+
+
+# ------------------------------------------------------------------ remote GPU worker client
+class RemoteError(Exception):
+    def __init__(self, message, retryable=False, status=None):
+        super().__init__(message)
+        self.retryable, self.status = retryable, status
+
+
+def remote_call(remote, method, path, body=None, ctype=None, timeout=REMOTE_TIMEOUT):
+    """One HTTP request to the GPU worker. Returns (headers, bytes); raises RemoteError with a friendly message."""
+    req = urllib.request.Request(remote["url"] + path, data=body, method=method)
+    req.add_header("Authorization", "Bearer " + remote["key"])
+    req.add_header("User-Agent", "VocalStudio/1.0")
+    if ctype:
+        req.add_header("Content-Type", ctype)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read() or b"{}").get("error") or ""
+        except (ValueError, OSError):
+            msg = ""
+        if e.code == 401:
+            raise RemoteError("The Colab access key was rejected. Copy the Key again from the notebook into Settings.", status=401)
+        if e.code in (502, 503, 504, 521, 522, 523, 524, 530):
+            raise RemoteError("The Colab worker is not responding (the notebook may have stopped or the session ended).",
+                              retryable=True, status=e.code)
+        if e.code == 404 and not msg:
+            raise RemoteError("Nothing is running at this Colab address. Start the notebook and paste the new Address.", status=404)
+        raise RemoteError(msg or f"Colab worker error ({e.code}).", retryable=e.code >= 500, status=e.code)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise RemoteError(f"Cannot reach the Colab worker ({reason}). Is the notebook still running?", retryable=True)
+
+
+def remote_health(remote, timeout=20):
+    t = time.time()
+    _, data = remote_call(remote, "GET", "/health", timeout=timeout)
+    try:
+        info = json.loads(data)
+    except ValueError:
+        raise RemoteError("That address answered, but it is not a Vocal Studio worker.")
+    if "version" not in info:
+        raise RemoteError("That address answered, but it is not a Vocal Studio worker.")
+    info["latency_ms"] = round((time.time() - t) * 1000)
+    return info
+
+
+_status_cache = {"key": None, "t": 0.0, "data": None}
+_status_lock = threading.Lock()
+
+
+def colab_status():
+    """Live connection state for the header pill. Cached ~4 s so several open tabs don't hammer the worker."""
+    s = load_settings()
+    if s["engine"] != "colab":
+        return {"engine": "local"}
+    if not (s["colab_url"] and s["colab_key"]):
+        return {"engine": "colab", "connected": False, "error": "Colab GPU is selected but not set up. Open Settings."}
+    ck = (s["colab_url"], s["colab_key"])
+    with _status_lock:
+        c = _status_cache
+        if c["key"] == ck and time.time() - c["t"] < 4:
+            return c["data"]
+    try:
+        info = remote_health({"url": s["colab_url"], "key": s["colab_key"]}, timeout=8)
+        data = {"engine": "colab", "connected": bool(info.get("ok")), "gpu": info.get("gpu"),
+                "device": info.get("device"), "latency_ms": info["latency_ms"]}
+        if not info.get("ok"):
+            data["error"] = "Connected, but the model is still loading."
+    except RemoteError as e:
+        data = {"engine": "colab", "connected": False, "error": str(e)}
+    with _status_lock:
+        _status_cache.update(key=ck, t=time.time(), data=data)
+    return data
+
+
+def decode_wav(data):
+    """16-bit PCM mono WAV bytes from the worker -> (float tensor [1, N], sample_rate)."""
+    with wave.open(io.BytesIO(data), "rb") as w:
+        if w.getsampwidth() != 2:
+            raise RemoteError("The Colab worker sent audio in an unexpected format.")
+        sr, ch = w.getframerate(), w.getnchannels()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32767.0
+    if ch > 1:
+        pcm = pcm.reshape(-1, ch).mean(axis=1)
+    return torch.from_numpy(pcm.copy()).unsqueeze(0), sr
+
+
+def with_retries(fn):
+    for attempt in range(REMOTE_RETRIES):
+        try:
+            return fn()
+        except RemoteError as e:
+            if not e.retryable or attempt == REMOTE_RETRIES - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
 # ------------------------------------------------------------------ text to speech
 _model = None
 
@@ -158,6 +305,50 @@ def get_model():
 audio_lock = threading.Lock()   # numbering + writing of <Project>_<N>.wav
 
 
+def prepare_engine(job):
+    """Return (generate(text) -> float tensor [1, N], sample_rate) for the job's speech engine."""
+    settings = dict(exaggeration=job["exaggeration"], cfg_weight=job["cfg"])
+    if job["engine"] == "local":
+        job_update(job, status="loading model")
+        model = get_model()
+        return (lambda text: model.generate(text, audio_prompt_path=job["voice"], **settings)), model.sr
+
+    remote = job["remote"]
+    job_update(job, status="connecting")
+    info = with_retries(lambda: remote_health(remote))
+    if not info.get("ok"):
+        raise RemoteError("The Colab worker is still loading the model. Wait for READY in the notebook, then try again.")
+    job_update(job, gpu=info.get("gpu") or info.get("device"))
+    voice = {"id": None}
+
+    def upload_voice():
+        with open(job["voice"], "rb") as fh:
+            _, data = remote_call(remote, "POST", "/voice", fh.read(), "audio/wav")
+        voice["id"] = json.loads(data)["voice_id"]
+    if job["voice"]:
+        with_retries(upload_voice)
+
+    def generate(text):
+        body = json.dumps({"text": text, "exaggeration": job["exaggeration"], "cfg": job["cfg"],
+                           "voice_id": voice["id"]}).encode()
+        try:
+            _, data = with_retries(lambda: remote_call(remote, "POST", "/generate", body, "application/json"))
+        except RemoteError as e:
+            if e.status != 409 or not job["voice"]:
+                raise
+            with_retries(upload_voice)          # worker restarted and lost the sample: send it again once
+            body2 = json.dumps({"text": text, "exaggeration": job["exaggeration"], "cfg": job["cfg"],
+                                "voice_id": voice["id"]}).encode()
+            _, data = with_retries(lambda: remote_call(remote, "POST", "/generate", body2, "application/json"))
+        wav, rate = decode_wav(data)
+        if rate != sr:
+            raise RemoteError(f"The Colab worker changed sample rate mid-job ({rate} vs {sr} Hz). Please try again.")
+        return wav
+
+    sr = int(info.get("sample_rate") or 24000)
+    return generate, sr
+
+
 def tts_worker():
     while True:
         jid = tts_q.get()
@@ -167,19 +358,17 @@ def tts_worker():
             tts_q.task_done()
             continue
         try:
-            job_update(job, status="loading model")
-            model = get_model()
             chunks = split_text(job["text"], CHUNK_CHARS)
             if not chunks:
                 raise ValueError("The text is empty after cleanup.")
+            generate, sr = prepare_engine(job)
             total_chars = sum(len(c) for c in chunks)
             t0 = time.time()
             job_update(job, status="generating", total=len(chunks), done=0, elapsed=0, eta=None, t0=t0,
                        parts=[c[:70] + ("..." if len(c) > 70 else "") for c in chunks])
             wavs, chars_done = [], 0
             for i, chunk in enumerate(chunks):
-                wavs.append(model.generate(chunk, audio_prompt_path=job["voice"],
-                                           exaggeration=job["exaggeration"], cfg_weight=job["cfg"]))
+                wavs.append(generate(chunk))
                 chars_done += len(chunk)
                 el = time.time() - t0
                 job_update(job, done=i + 1, elapsed=round(el),
@@ -189,8 +378,11 @@ def tts_worker():
             os.makedirs(pdir, exist_ok=True)
             with audio_lock:
                 name = next_audio_name(job["project"])
-                ta.save(os.path.join(pdir, name), wav, model.sr)
-            job_update(job, status="done", file=name, seconds=round(wav.shape[-1] / model.sr, 1))
+                ta.save(os.path.join(pdir, name), wav, sr)
+            job_update(job, status="done", file=name, seconds=round(wav.shape[-1] / sr, 1),
+                       took=round(time.time() - t0))
+        except RemoteError as e:
+            job_update(job, status="error", error=str(e), remoteFailed=True)
         except Exception as e:
             job_update(job, status="error", error=f"Generation failed: {e}")
         finally:
@@ -430,6 +622,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_body(200, fh.read(), ctype)
         if path == "/api/projects":
             return self.send_json(list_projects())
+        if path == "/api/settings":
+            return self.send_json(public_settings(load_settings()))
+        if path == "/api/colab/status":
+            return self.send_json(colab_status())
         if path == "/api/active":   # lets a reloaded page re-attach to running jobs
             with state_lock:
                 return self.send_json({
@@ -523,6 +719,40 @@ class Handler(BaseHTTPRequestHandler):
             os.makedirs(project_dir(existing), exist_ok=True)
             return self.send_json({"name": existing})
 
+        if path == "/api/settings":
+            body = self.read_json()
+            s = load_settings()
+            if "engine" in body:
+                if body["engine"] not in ENGINES:
+                    raise ApiError(400, "Unknown speech engine.")
+                s["engine"] = body["engine"]
+            if "colab_url" in body:
+                s["colab_url"] = normalize_url(body["colab_url"])
+            if body.get("colab_key"):                 # empty = keep the saved key
+                s["colab_key"] = str(body["colab_key"]).strip()[:200]
+            if body.get("clear_key"):
+                s["colab_key"] = ""
+            if s["engine"] == "colab" and not (s["colab_url"] and s["colab_key"]):
+                raise ApiError(400, "To use Colab GPU, add both the Address and the Key from the notebook.")
+            save_settings(s)
+            return self.send_json(public_settings(s))
+
+        if path == "/api/colab/test":
+            body = self.read_json()
+            s = load_settings()
+            url = normalize_url(body.get("colab_url") or s["colab_url"])
+            key = str(body.get("colab_key") or "").strip() or s["colab_key"]
+            if not url or not key:
+                raise ApiError(400, "Enter the Address and Key from the notebook first.")
+            try:
+                info = remote_health({"url": url, "key": key})
+            except RemoteError as e:
+                return self.send_json({"ok": False, "error": str(e)})
+            if not info.get("ok"):
+                return self.send_json({"ok": False, "error": "Connected, but the model is still loading. Wait for READY in the notebook."})
+            return self.send_json({"ok": True, "gpu": info.get("gpu"), "device": info.get("device"),
+                                   "latency_ms": info["latency_ms"]})
+
         if path == "/api/generate":
             body = self.read_json()
             text = str(body.get("text") or "").strip()
@@ -546,6 +776,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(413, "The voice sample is too large (max 25 MB).")
                 if not (voice_bytes[:4] == b"RIFF" and voice_bytes[8:12] == b"WAVE"):
                     raise ApiError(400, "The voice sample must be a .wav file.")
+            s = load_settings()
+            engine, remote = s["engine"], None
+            if engine == "colab":
+                if not (s["colab_url"] and s["colab_key"]):
+                    raise ApiError(400, "Colab GPU is selected but not set up yet. Open Settings and add the Address and Key.")
+                remote = {"url": s["colab_url"], "key": s["colab_key"]}
             voice_path = None
             if voice_bytes:   # only written once everything else is validated
                 voice_path = os.path.join(VOICES, uuid.uuid4().hex + ".wav")
@@ -555,6 +791,7 @@ class Handler(BaseHTTPRequestHandler):
             jid = uuid.uuid4().hex
             with state_lock:
                 tts_jobs[jid] = dict(text=text, voice=voice_path, project=project, status="queued",
+                                     engine=engine, remote=remote,
                                      done=0, total=0, exaggeration=exaggeration, cfg=cfg, created=time.time())
             tts_q.put(jid)
             return self.send_json({"id": jid})

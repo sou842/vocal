@@ -21,3 +21,7 @@ test.wav
 Thumbs.db
 .DS_Store
 *.log
+
+# Local app settings (holds the Colab access key)
+settings.json
+settings.json.tmp
