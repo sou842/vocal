@@ -212,6 +212,7 @@ async function refreshCounts(){
 /* ================================================================ router */
 const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'videos', 'settings'];
 const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', videos: 'Videos', settings: 'Settings'};
+function setCrumb(text){ $('crumbPage').textContent = text; $('crumbPage').title = text; }
 function show(view){
   VIEWS.forEach(v => { $('view-' + v).hidden = v !== view; });
   const nav = view === 'doc' ? 'documents' : view;
@@ -219,12 +220,12 @@ function show(view){
     a.classList.toggle('active', a.dataset.route === nav);
     if (a.dataset.route === nav) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   });
-  $('crumbPage').textContent = TITLES[view] || '';
+  setCrumb(TITLES[view] || '');
   openSidebar(false);
 }
 function currentRoute(){ return location.hash.replace(/^#\/?/, ''); }
 function route(){
-  if (!curProject()){ show('empty'); $('crumbPage').textContent = 'Get started'; return; }
+  if (!curProject()){ show('empty'); setCrumb('Get started'); return; }
   const h = currentRoute();
   if (h.startsWith('doc/')){ show('doc'); openDoc(h.slice(4)); return; }
   const v = ['generate', 'documents', 'audio', 'videos', 'settings'].includes(h) ? h : 'generate';
@@ -242,9 +243,10 @@ window.addEventListener('hashchange', route);
 
 /* ================================================================ generate speech */
 function updateCount(){
-  const n = $('text').value.length;
-  $('count').textContent = n.toLocaleString() + ' characters';
-  $('est').textContent = '~' + Math.round(n / 15).toLocaleString() + ' s of audio';
+  const t = $('text').value, w = words(t);
+  $('count').textContent = w.toLocaleString() + (w === 1 ? ' word' : ' words') + '  ·  ' + t.length.toLocaleString() + ' characters';
+  $('est').textContent = w ? 'About ' + fmtLong(Math.round(w / 2.6)) + ' of audio' : '';
+  if (typeof refreshGenerate === 'function') refreshGenerate();
 }
 $('text').oninput = updateCount;
 $('clearScript').onclick = () => { $('text').value = ''; updateCount(); $('text').focus(); };
@@ -292,7 +294,7 @@ $('go').onclick = async () => {
 function renderDetails(j){
   $('stats').hidden = false; $('parts').hidden = false;
   $('sDone').textContent = j.done + ' / ' + j.total;
-  $('sLeft').textContent = (j.total - j.done) + ' parts';
+  $('sLeft').textContent = j.total - j.done;
   $('sEl').textContent = fmt(j.elapsed || 0);
   $('sEta').textContent = j.done ? '~' + fmt(j.eta) : 'calculating...';
   const el = $('parts');
@@ -320,13 +322,20 @@ const audioUrl = (project, file) => '/projects/' + encodeURIComponent(project) +
 function showResult(project, file, seconds){
   const url = audioUrl(project, file);
   $('result').innerHTML = `
-    <div class="mt-5 border-t pt-5">
-      <div class="flex items-center justify-between gap-2">
-        <span class="truncate font-medium">${esc(project)} / ${esc(file)}${seconds ? ' &middot; ' + esc(seconds) + ' s' : ''}</span>
-        <a class="btn btn-primary btn-sm" href="${url}" download>${ICON.dl} Download .wav</a>
+    <div class="mt-5 rounded-xl border bg-muted/40 p-4">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 font-medium">${lu('circle-check')}<span class="truncate">${esc(file)}</span></div>
+          <div class="hint">${esc(project)}${seconds ? '  ·  ' + esc(fmtLong(Math.round(seconds))) : ''}</div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button type="button" class="btn btn-outline btn-sm" data-mkvideo>${lu('clapperboard')}Make a video</button>
+          <a class="btn btn-primary btn-sm" href="${url}" download>${ICON.dl} Download .wav</a>
+        </div>
       </div>
       <audio class="mt-3 w-full" controls src="${url}"></audio>
     </div>`;
+  $('result').querySelector('[data-mkvideo]').onclick = () => openVideoDialog(file);
 }
 
 /* Polls a speech job until it finishes. Survives brief network hiccups; stops cleanly if the job is gone. */
@@ -361,9 +370,9 @@ async function pollTts(id){
     if (j.total){
       const pct = Math.round(j.done / j.total * 100);
       $('prog').style.width = pct + '%'; $('pct').textContent = pct + '%';
-      setStatus(`Generating part ${Math.min(j.done + 1, j.total)} of ${j.total} on ${engineLabel(j)}.` +
+      setStatus(`Recording sentence ${Math.min(j.done + 1, j.total)} of ${j.total} on ${engineLabel(j)}.` +
         (j.engine === 'colab' ? '' : ' This can take a while on CPU.'));
-      setJob('tts', `Generating ${j.done}/${j.total} parts`);
+      setJob('tts', `Recording ${j.done}/${j.total} sentences`);
       renderDetails(j);
     } else {
       const msg = {queued: ['Queued...', 'Queued'],
@@ -686,7 +695,7 @@ window.addEventListener('pagehide', () => saver.flushAll());
 
 async function openDoc(id){
   const project = curProject();
-  if (doc && doc.id === id && doc.project === project && $('exPages').childElementCount){ $('crumbPage').textContent = doc.name; return; }
+  if (doc && doc.id === id && doc.project === project && $('exPages').childElementCount){ setCrumb(doc.name); return; }
   const seq = ++openSeq;
   saver.flushAll();
   $('docName').textContent = 'Loading...'; $('docMeta').textContent = ''; $('exPages').innerHTML = ''; $('exNav').innerHTML = '';
@@ -695,7 +704,7 @@ async function openDoc(id){
   catch (e){ if (seq === openSeq){ showError(e); location.hash = '#/documents'; } return; }
   if (seq !== openSeq || curProject() !== project) return;   // user navigated away meanwhile
   doc = Object.assign(d, {project}); selected.clear(); $('exSearch').value = '';
-  $('crumbPage').textContent = doc.name;
+  setCrumb(doc.name);
   renderDoc();
 }
 
@@ -955,6 +964,7 @@ async function loadVoices(selectId){
     voiceList.map(v => `<option value="${esc(v.id)}">${esc(v.name)}${v.seconds ? ' (' + v.seconds + 's)' : ''}</option>`).join('');
   sel.value = voiceList.some(v => v.id === want) ? want : (voiceList.length && selectId == null && !store.get('voiceId') ? voiceList[0].id : '');
   voiceChanged();
+  $('voiceEmpty').hidden = voiceList.length > 0;
 }
 function voiceChanged(){
   const id = $('voiceSel').value;
@@ -963,6 +973,7 @@ function voiceChanged(){
   const a = $('voicePrev');
   a.pause(); a.hidden = !id;
   if (id) a.src = '/api/voices/' + encodeURIComponent(id) + '.wav'; else a.removeAttribute('src');
+  if (typeof refreshGenerate === 'function') refreshGenerate();
 }
 $('voiceSel').onchange = voiceChanged;
 $('voiceAddToggle').onclick = () => { const f = $('voiceAdd'); f.hidden = !f.hidden; $('voiceMsg').hidden = true; };
@@ -986,6 +997,59 @@ $('voiceDelete').onclick = async () => {
   catch (e){ toast(e.message); }
 };
 loadVoices();
+
+/* ================================================================ generate page: presets, quality, summary */
+const PRESETS = {
+  story: {ex: 0.55, cfg: 0.40, spd: 1.00, name: 'Storyteller'},
+  calm:  {ex: 0.40, cfg: 0.30, spd: 1.00, name: 'Calm'},
+  vivid: {ex: 0.80, cfg: 0.45, spd: 1.00, name: 'Dramatic'},
+};
+const QUAL = {
+  '3': {name: 'Best quality', hint: 'Listens to every sentence and re-records any glitch. Slowest, cleanest.'},
+  '2': {name: 'Balanced quality', hint: 'Up to 2 takes per sentence. A good middle ground.'},
+  '1': {name: 'Fast quality', hint: 'One take per sentence, no checking. Quickest.'},
+};
+const SEG_ON = ['bg-background', 'shadow-xs'], SEG_OFF = ['text-muted-foreground', 'hover:text-foreground'];
+const CARD_ON = ['border-primary', 'ring-2', 'ring-primary'];
+
+function currentPreset(){
+  const v = {ex: +$('ex').value, cfg: +$('cfg').value, spd: +$('spd').value};
+  return Object.keys(PRESETS).find(k => ['ex', 'cfg', 'spd'].every(f => Math.abs(PRESETS[k][f] - v[f]) < 0.001)) || 'custom';
+}
+function setSlider(id, v){ $(id).value = v; $(id).dispatchEvent(new Event('input')); }
+
+function refreshGenerate(){
+  const k = currentPreset();
+  document.querySelectorAll('[data-preset]').forEach(b => {
+    const on = b.dataset.preset === k;
+    CARD_ON.forEach(c => b.classList.toggle(c, on)); b.setAttribute('aria-pressed', on);
+  });
+  $('tuneTag').textContent = k === 'custom' ? '(custom settings)' : '';
+  const q = $('qual').value;
+  document.querySelectorAll('[data-qual]').forEach(b => {
+    const on = b.dataset.qual === q;
+    SEG_ON.forEach(c => b.classList.toggle(c, on)); SEG_OFF.forEach(c => b.classList.toggle(c, !on)); b.setAttribute('aria-checked', on);
+  });
+  $('qualHint').textContent = (QUAL[q] || QUAL['3']).hint;
+  const v = voiceList.find(x => x.id === $('voiceSel').value);
+  const secs = Math.round(words($('text').value) / 2.6);
+  $('genSummary').textContent = [v ? v.name : 'Default voice', k === 'custom' ? 'Custom delivery' : PRESETS[k].name,
+    (QUAL[q] || QUAL['3']).name, secs ? '~' + fmtLong(secs) : ''].filter(Boolean).join('  ·  ');
+}
+function fmtLong(s){ return s >= 60 ? Math.floor(s / 60) + ' min ' + String(s % 60).padStart(2, '0') + ' s' : s + ' s'; }
+
+function saveTune(){ store.set('tune', JSON.stringify({ex: $('ex').value, cfg: $('cfg').value, spd: $('spd').value, qual: $('qual').value})); }
+['ex', 'cfg', 'spd'].forEach(id => $(id).addEventListener('input', () => { refreshGenerate(); saveTune(); }));
+document.querySelectorAll('[data-preset]').forEach(b => b.onclick = () => {
+  const p = PRESETS[b.dataset.preset];
+  setSlider('ex', p.ex); setSlider('cfg', p.cfg); setSlider('spd', p.spd);
+});
+document.querySelectorAll('[data-qual]').forEach(b => b.onclick = () => { $('qual').value = b.dataset.qual; refreshGenerate(); saveTune(); });
+try {   // restore the last settings
+  const t = JSON.parse(store.get('tune') || 'null');
+  if (t){ setSlider('ex', t.ex); setSlider('cfg', t.cfg); setSlider('spd', t.spd); if (QUAL[t.qual]) $('qual').value = t.qual; }
+} catch (e){ /* keep defaults */ }
+refreshGenerate();
 
 /* ================================================================ video creation
    Styles (and their options, e.g. theme colors) come from the server (video/styles/*.py),

@@ -100,12 +100,12 @@
       <button id="menuBtn" class="btn btn-ghost btn-icon -ml-2 md:hidden" aria-label="Open menu"><i data-lucide="menu"></i></button>
       <button id="collapseBtn" class="btn btn-ghost btn-icon -ml-2 hidden md:inline-flex" title="Collapse sidebar (Ctrl+B)" aria-label="Toggle sidebar"><i data-lucide="panel-left"></i></button>
       <div class="hidden h-5 w-px bg-border md:block"></div>
-      <nav class="flex min-w-0 items-center gap-1.5 text-sm">
-        <span id="crumbProject" class="hidden truncate text-muted-foreground sm:inline"></span>
-        <i data-lucide="chevron-right" class="hidden size-3.5 text-muted-foreground sm:block"></i>
-        <span id="crumbPage" class="truncate font-medium"></span>
+      <nav class="flex min-w-0 flex-1 items-center gap-1.5 text-sm">
+        <span id="crumbProject" class="hidden max-w-[9rem] shrink-0 truncate text-muted-foreground sm:inline"></span>
+        <i data-lucide="chevron-right" class="hidden size-3.5 shrink-0 text-muted-foreground sm:block"></i>
+        <span id="crumbPage" class="min-w-0 truncate font-medium"></span>
       </nav>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex shrink-0 items-center gap-2">
         <a id="engPill" href="#/settings" class="badge hover:bg-accent" role="status" title="Speech engine">
           <span id="engDot" class="size-1.5 rounded-full bg-current"></span><span id="engText" class="hidden sm:inline">Local CPU</span>
         </a>
@@ -135,99 +135,151 @@
       <section id="view-generate" hidden>
         <div class="mb-6">
           <h1 class="text-2xl font-semibold tracking-tight">Generate speech</h1>
-          <p class="text-muted-foreground">Turn text into a .wav file. Output is saved to the current project.</p>
+          <p class="text-muted-foreground">Write or paste your script, choose a voice, then press Generate. The audio is saved in the current project.</p>
         </div>
 
-        <div class="grid gap-4 lg:grid-cols-3">
-          <div class="card lg:col-span-2">
-            <div class="flex items-center justify-between p-5 pb-0">
-              <div>
-                <h2 class="font-semibold">Script</h2>
-                <p class="hint text-sm">Type, paste, or send text from a document.</p>
+        <div class="grid gap-4 lg:grid-cols-5">
+
+          <!-- ===== Step 1: script ===== -->
+          <div class="card flex flex-col lg:col-span-3">
+            <div class="flex items-center justify-between gap-3 p-5 pb-0">
+              <div class="flex items-center gap-3">
+                <span class="grid size-6 shrink-0 place-items-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">1</span>
+                <div>
+                  <h2 class="font-semibold leading-tight">Your script</h2>
+                  <p class="hint text-sm">Type, paste, or send text from a document.</p>
+                </div>
               </div>
-              <button id="clearScript" class="btn btn-ghost btn-sm"><i data-lucide="eraser"></i>Clear</button>
+              <button id="clearScript" class="btn btn-ghost btn-sm" title="Clear the script"><i data-lucide="eraser"></i>Clear</button>
             </div>
-            <div class="p-5">
-              <textarea id="text" class="input h-auto min-h-72 resize-y py-2.5 leading-relaxed" placeholder="Enter your text here..."></textarea>
-              <div class="mt-2 flex justify-between hint"><span id="count">0 characters</span><span id="est">~0 s of audio</span></div>
+            <div class="flex flex-1 flex-col p-5">
+              <textarea id="text" class="input h-auto min-h-80 flex-1 resize-y py-3 text-[15px] leading-relaxed" placeholder="Paste or type what the narrator should say.&#10;&#10;Tip: short paragraphs and normal punctuation give the most natural pacing."></textarea>
+              <div class="mt-2 flex flex-wrap justify-between gap-x-4 hint"><span id="count">0 words</span><span id="est"></span></div>
             </div>
           </div>
 
-          <div class="card">
-            <div class="p-5 pb-0">
-              <h2 class="font-semibold">Voice settings</h2>
-              <p class="hint text-sm">Fine-tune how the voice sounds.</p>
+          <!-- ===== Steps 2 + 3: voice and delivery ===== -->
+          <div class="card lg:col-span-2">
+
+            <div class="flex items-center gap-3 p-5 pb-0">
+              <span class="grid size-6 shrink-0 place-items-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">2</span>
+              <div>
+                <h2 class="font-semibold leading-tight">Voice</h2>
+                <p class="hint text-sm">Who should read it?</p>
+              </div>
             </div>
-            <div class="space-y-5 p-5">
-              <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="ex">Expressiveness</label><span id="exv" class="hint tabular-nums">0.55</span></div>
-                <input id="ex" type="range" min="0.25" max="1.5" step="0.05" value="0.55" class="w-full">
-                <p class="mt-1 hint">Higher is more dramatic, lower is calmer.</p>
+            <div class="p-5">
+              <div class="mb-2 flex items-center justify-between">
+                <label class="label" for="voiceSel">Narrator</label>
+                <span class="flex gap-3 text-xs">
+                  <button type="button" id="voiceAddToggle" class="cursor-pointer underline underline-offset-2 text-muted-foreground hover:text-foreground">Add voice</button>
+                  <button type="button" id="voiceDelete" class="cursor-pointer underline underline-offset-2 text-muted-foreground hover:text-destructive" hidden>Delete</button>
+                </span>
               </div>
-              <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="cfg">Pace / adherence</label><span id="cfv" class="hint tabular-nums">0.40</span></div>
-                <input id="cfg" type="range" min="0.1" max="1" step="0.05" value="0.40" class="w-full">
-                <p class="mt-1 hint">Lower values give slower, more deliberate pacing.</p>
+              <select id="voiceSel" class="input"></select>
+              <audio id="voicePrev" class="mt-2 w-full" controls preload="none" hidden></audio>
+              <div id="voiceEmpty" class="mt-2 rounded-md border border-dashed bg-muted/50 px-3 py-2 text-xs text-muted-foreground" hidden>
+                For the best result, add your own narrator: upload a short clean clip and the generated voice copies its pace and style.
               </div>
-              <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="spd">Speaking speed</label><span id="spv" class="hint tabular-nums">1.00x</span></div>
-                <input id="spd" type="range" min="0.8" max="1.2" step="0.05" value="1.00" class="w-full">
-                <p class="mt-1 hint">A gentle slow-down. Below 0.85x it can start to sound stretched. Sentences also get natural, slightly varied pauses.</p>
+              <div id="voiceAdd" class="mt-3 space-y-2 rounded-md border bg-muted/50 p-3" hidden>
+                <input id="voiceName" class="input h-8 bg-background" placeholder="Name, e.g. My narrator" maxlength="40" autocomplete="off">
+                <input id="voiceFile" type="file" accept=".wav,audio/wav" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
+                <p class="hint">One calm voice, 6-20 seconds, no music or background noise (.wav).</p>
+                <button type="button" id="voiceSave" class="btn btn-primary btn-sm">Save voice</button>
+                <p id="voiceMsg" class="text-xs text-destructive" hidden></p>
               </div>
+            </div>
+
+            <div class="border-t"></div>
+
+            <div class="flex items-center gap-3 p-5 pb-0">
+              <span class="grid size-6 shrink-0 place-items-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">3</span>
               <div>
-                <div class="mb-2 flex items-center justify-between">
-                  <label class="label" for="voiceSel">Voice</label>
-                  <span class="flex gap-3 text-xs">
-                    <button type="button" id="voiceAddToggle" class="cursor-pointer underline underline-offset-2 text-muted-foreground hover:text-foreground">Add voice</button>
-                    <button type="button" id="voiceDelete" class="cursor-pointer underline underline-offset-2 text-muted-foreground hover:text-destructive" hidden>Delete</button>
-                  </span>
+                <h2 class="font-semibold leading-tight">Delivery</h2>
+                <p class="hint text-sm">How should it sound?</p>
+              </div>
+            </div>
+            <div class="space-y-4 p-5">
+              <div id="presets" class="grid gap-2 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
+                <button type="button" data-preset="story" class="cursor-pointer rounded-lg border p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
+                  <div class="text-sm font-medium">Storyteller</div><div class="hint">Natural and warm</div>
+                </button>
+                <button type="button" data-preset="calm" class="cursor-pointer rounded-lg border p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
+                  <div class="text-sm font-medium">Calm</div><div class="hint">Slower and steady</div>
+                </button>
+                <button type="button" data-preset="vivid" class="cursor-pointer rounded-lg border p-3 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
+                  <div class="text-sm font-medium">Dramatic</div><div class="hint">More emotion</div>
+                </button>
+              </div>
+
+              <details id="tune" class="group rounded-lg border">
+                <summary class="flex cursor-pointer list-none items-center justify-between px-3 py-2.5 text-sm font-medium">
+                  <span>Fine-tune <span id="tuneTag" class="ml-1 hint font-normal"></span></span>
+                  <i data-lucide="chevron-down" class="size-4 text-muted-foreground transition-transform group-open:rotate-180"></i>
+                </summary>
+                <div class="space-y-5 border-t p-3">
+                  <div>
+                    <div class="mb-2 flex justify-between"><label class="label" for="ex">Expression</label><span id="exv" class="hint tabular-nums">0.55</span></div>
+                    <input id="ex" type="range" min="0.25" max="1.5" step="0.05" value="0.55" class="w-full">
+                    <div class="mt-1 flex justify-between hint"><span>Calmer</span><span>More dramatic</span></div>
+                  </div>
+                  <div>
+                    <div class="mb-2 flex justify-between"><label class="label" for="cfg">Pacing</label><span id="cfv" class="hint tabular-nums">0.40</span></div>
+                    <input id="cfg" type="range" min="0.1" max="1" step="0.05" value="0.40" class="w-full">
+                    <div class="mt-1 flex justify-between hint"><span>Slow, deliberate</span><span>Brisker</span></div>
+                  </div>
+                  <div>
+                    <div class="mb-2 flex justify-between"><label class="label" for="spd">Speed</label><span id="spv" class="hint tabular-nums">1.00x</span></div>
+                    <input id="spd" type="range" min="0.8" max="1.2" step="0.05" value="1.00" class="w-full">
+                    <div class="mt-1 flex justify-between hint"><span>Slower</span><span>Faster</span></div>
+                    <p class="mt-1 hint">Keep this near 1.00x. Stretching the audio too far starts to sound artificial.</p>
+                  </div>
                 </div>
-                <select id="voiceSel" class="input"></select>
-                <audio id="voicePrev" class="mt-2 w-full" controls preload="none" hidden></audio>
-                <div id="voiceAdd" class="mt-3 space-y-2 rounded-md border bg-muted/50 p-3" hidden>
-                  <input id="voiceName" class="input h-8 bg-background" placeholder="Name, e.g. My narrator" maxlength="40" autocomplete="off">
-                  <input id="voiceFile" type="file" accept=".wav,audio/wav" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
-                  <p class="hint">One calm voice, 6-20 seconds, no music or background noise (.wav). The generated voice copies its pace, tone and style.</p>
-                  <button type="button" id="voiceSave" class="btn btn-primary btn-sm">Save voice</button>
-                  <p id="voiceMsg" class="text-xs text-destructive" hidden></p>
-                </div>
-                <p class="mt-1 hint">Pick your saved narrator. Without one, a default voice is used.</p>
-              </div>
+              </details>
+
               <div>
-                <div class="mb-2 flex justify-between"><label class="label" for="qual">Voice quality</label></div>
-                <select id="qual" class="input">
-                  <option value="3">Best: listens to every sentence and re-records glitches</option>
-                  <option value="2">Balanced: up to 2 takes per sentence</option>
-                  <option value="1">Fast: a single take</option>
+                <div class="label mb-2">Quality</div>
+                <div id="qualBtns" class="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1" role="radiogroup" aria-label="Quality">
+                  <button type="button" role="radio" data-qual="3" class="cursor-pointer rounded-md px-2 py-1.5 text-xs font-medium transition-colors">Best</button>
+                  <button type="button" role="radio" data-qual="2" class="cursor-pointer rounded-md px-2 py-1.5 text-xs font-medium transition-colors">Balanced</button>
+                  <button type="button" role="radio" data-qual="1" class="cursor-pointer rounded-md px-2 py-1.5 text-xs font-medium transition-colors">Fast</button>
+                </div>
+                <p id="qualHint" class="mt-1.5 hint"></p>
+                <select id="qual" class="hidden" aria-hidden="true" tabindex="-1">
+                  <option value="3">Best</option><option value="2">Balanced</option><option value="1">Fast</option>
                 </select>
-                <p class="mt-1 hint">Best takes longer but catches skipped or garbled words.</p>
               </div>
-              <div class="flex items-center justify-between gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+            </div>
+
+            <div class="space-y-3 border-t bg-muted/30 p-5">
+              <div class="flex items-center justify-between gap-2 text-xs">
                 <span class="flex min-w-0 items-center gap-2">
                   <i data-lucide="cpu" class="size-3.5 shrink-0 text-muted-foreground"></i>
                   <span class="truncate">Engine: <b id="engineName">Local CPU</b> <span id="engineState" class="text-muted-foreground"></span></span>
                 </span>
                 <a href="#/settings" class="shrink-0 font-medium underline underline-offset-2">Change</a>
               </div>
-              <button id="go" class="btn btn-primary h-10 w-full"><i data-lucide="play"></i>Generate audio</button>
+              <p id="genSummary" class="hint"></p>
+              <button id="go" class="btn btn-primary h-11 w-full text-[15px]"><i data-lucide="play"></i>Generate audio</button>
             </div>
           </div>
         </div>
 
+        <!-- ===== Output ===== -->
         <div class="card mt-4">
           <div class="p-5 pb-0">
-            <h2 class="font-semibold">Output</h2>
+            <h2 class="font-semibold">Your audio</h2>
             <p class="hint text-sm">Progress and the finished file appear here.</p>
           </div>
           <div class="p-5">
             <div class="mb-2.5 flex items-center justify-between gap-2">
-              <span id="status" class="text-muted-foreground">Waiting for a script.</span>
+              <span id="status" class="text-muted-foreground">Ready when you are. Add a script, then press Generate.</span>
               <span id="pct" class="hint tabular-nums"></span>
             </div>
             <div class="progress"><div id="prog" style="width:0"></div></div>
             <div id="stats" class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4" hidden>
-              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Completed</div><div id="sDone" class="text-lg font-semibold tabular-nums">0</div></div>
-              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Pending</div><div id="sLeft" class="text-lg font-semibold tabular-nums">0</div></div>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Sentences done</div><div id="sDone" class="text-lg font-semibold tabular-nums">0</div></div>
+              <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Remaining</div><div id="sLeft" class="text-lg font-semibold tabular-nums">0</div></div>
               <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Elapsed</div><div id="sEl" class="text-lg font-semibold tabular-nums">0:00</div></div>
               <div class="rounded-lg border bg-muted px-3 py-2"><div class="text-[11px] uppercase tracking-wide text-muted-foreground">Time left</div><div id="sEta" class="text-lg font-semibold tabular-nums">--</div></div>
             </div>

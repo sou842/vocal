@@ -142,7 +142,7 @@
   .card { @apply bg-card text-card-foreground rounded-xl border shadow-xs; }
   .label { @apply text-sm font-medium; }
   .hint { @apply text-xs text-muted-foreground; }
-  .badge { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium text-muted-foreground; }
+  .badge { @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-0.5 text-xs font-medium text-muted-foreground; }
   .nav-link {
     @apply flex items-center gap-3 rounded-md px-3 h-9 text-sm font-medium text-sidebar-foreground/80 cursor-pointer
       hover:bg-sidebar-accent hover:text-sidebar-accent-foreground [&_svg]:size-4;
