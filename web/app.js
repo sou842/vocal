@@ -250,6 +250,7 @@ $('text').oninput = updateCount;
 $('clearScript').onclick = () => { $('text').value = ''; updateCount(); $('text').focus(); };
 $('ex').oninput = () => { $('exv').textContent = (+$('ex').value).toFixed(2); };
 $('cfg').oninput = () => { $('cfv').textContent = (+$('cfg').value).toFixed(2); };
+$('spd').oninput = () => { $('spv').textContent = (+$('spd').value).toFixed(2) + 'x'; };
 
 function setStatus(t, err){
   $('status').textContent = t;
@@ -275,13 +276,12 @@ function resetOutput(){
 $('go').onclick = async () => {
   const text = $('text').value.trim();
   if (!text){ setStatus('Please enter some text first.', true); setBadge('err', 'No text'); $('text').focus(); return; }
-  const vf = $('voice').files[0];
-  if (vf && vf.size > 25 * 1024 * 1024){ setStatus('The voice sample is too large (max 25 MB).', true); return; }
   setBusy(true); resetOutput();
   setStatus('Sending request...'); setBadge('run', 'Working'); setJob('tts', 'Starting...');
   try {
-    const body = {text, project: curProject(), exaggeration: $('ex').value, cfg: $('cfg').value};
-    if (vf) body.voice = await fileToB64(vf);
+    const body = {text, project: curProject(), exaggeration: $('ex').value, cfg: $('cfg').value, speed: $('spd').value,
+                  quality: $('qual').value};
+    if ($('voiceSel').value) body.voice_id = $('voiceSel').value;
     const j = await api.post('/api/generate', body);
     pollTts(j.id);
   } catch (e){
@@ -345,7 +345,8 @@ async function pollTts(id){
     if (j.status === 'done'){
       $('prog').style.width = '100%'; $('pct').textContent = '100%';
       if (j.total){ j.done = j.total; j.eta = 0; renderDetails(j); }
-      setStatus(`Finished${j.took != null ? ' in ' + fmt(j.took) : ''} on ${engineLabel(j)}. ${j.seconds} seconds of audio saved as ${j.file} in project ${j.project}.`);
+      setStatus(`Finished${j.took != null ? ' in ' + fmt(j.took) : ''} on ${engineLabel(j)}. ${j.seconds} seconds of audio saved as ${j.file} in project ${j.project}.` +
+        (j.retakes ? ` ${j.retakes} sentence take${j.retakes === 1 ? ' was' : 's were'} re-recorded to fix glitches.` : '') + (j.note ? ' ' + j.note : ''));
       setBadge('ok', 'Done'); setJob('tts', null);
       showResult(j.project, j.file, j.seconds);
       setBusy(false); refreshCounts(); toast('Saved ' + j.file);
@@ -943,6 +944,48 @@ function showRemoteFallback(){
     } catch (e){ showError(e); }
   };
 }
+
+/* ================================================================ saved voices (narrators) */
+let voiceList = [];
+async function loadVoices(selectId){
+  try { voiceList = await api.get('/api/voices'); } catch (e){ voiceList = []; }
+  const want = selectId != null ? selectId : (store.get('voiceId') || '');
+  const sel = $('voiceSel');
+  sel.innerHTML = `<option value="">Default voice</option>` +
+    voiceList.map(v => `<option value="${esc(v.id)}">${esc(v.name)}${v.seconds ? ' (' + v.seconds + 's)' : ''}</option>`).join('');
+  sel.value = voiceList.some(v => v.id === want) ? want : (voiceList.length && selectId == null && !store.get('voiceId') ? voiceList[0].id : '');
+  voiceChanged();
+}
+function voiceChanged(){
+  const id = $('voiceSel').value;
+  store.set('voiceId', id);
+  $('voiceDelete').hidden = !id;
+  const a = $('voicePrev');
+  a.pause(); a.hidden = !id;
+  if (id) a.src = '/api/voices/' + encodeURIComponent(id) + '.wav'; else a.removeAttribute('src');
+}
+$('voiceSel').onchange = voiceChanged;
+$('voiceAddToggle').onclick = () => { const f = $('voiceAdd'); f.hidden = !f.hidden; $('voiceMsg').hidden = true; };
+$('voiceSave').onclick = async () => {
+  const f = $('voiceFile').files[0], msg = $('voiceMsg');
+  msg.hidden = true;
+  if (!f){ msg.textContent = 'Choose a .wav file first.'; msg.hidden = false; return; }
+  $('voiceSave').disabled = true;
+  try {
+    const v = await api.post('/api/voices', {name: $('voiceName').value.trim() || f.name.replace(/\.wav$/i, ''), data: await fileToB64(f)});
+    $('voiceFile').value = ''; $('voiceName').value = ''; $('voiceAdd').hidden = true;
+    await loadVoices(v.id);
+    toast('Voice saved: ' + v.name);
+  } catch (e){ msg.textContent = e.message; msg.hidden = false; }
+  $('voiceSave').disabled = false;
+};
+$('voiceDelete').onclick = async () => {
+  const id = $('voiceSel').value, v = voiceList.find(x => x.id === id);
+  if (!id || !confirm(`Delete the voice "${v ? v.name : ''}"?`)) return;
+  try { await api.post('/api/voices/delete', {id}); await loadVoices(''); toast('Voice deleted'); }
+  catch (e){ toast(e.message); }
+};
+loadVoices();
 
 /* ================================================================ video creation
    Styles (and their options, e.g. theme colors) come from the server (video/styles/*.py),

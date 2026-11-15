@@ -21,6 +21,7 @@ import io
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import sys
@@ -39,7 +40,9 @@ import torch
 import torchaudio as ta
 
 import video
-from tts import split_text
+import voicecheck
+import voicelib
+from tts import polish_chunk, split_story, time_stretch
 
 # ------------------------------------------------------------------ configuration
 HOST, PORT = "127.0.0.1", 8000
@@ -391,7 +394,8 @@ def tts_worker():
             tts_q.task_done()
             continue
         try:
-            chunks = split_text(job["text"], CHUNK_CHARS)
+            pieces = split_story(job["text"], CHUNK_CHARS)   # [(sentence, pause after it)]
+            chunks = [c for c, _ in pieces]
             if not chunks:
                 raise ValueError("The text is empty after cleanup.")
             generate, sr = prepare_engine(job)
@@ -399,9 +403,22 @@ def tts_worker():
             t0 = time.time()
             job_update(job, status="generating", total=len(chunks), done=0, elapsed=0, eta=None, t0=t0,
                        parts=[c[:70] + ("..." if len(c) > 70 else "") for c in chunks])
-            wavs, chars_done = [], 0
+            wavs, chars_done, retakes = [], 0, 0
+            takes = job["quality"] if (job["quality"] <= 1 or voicecheck.available()) else 1
+            voicecheck.last_error = None
             for i, chunk in enumerate(chunks):
-                wavs.append(generate(chunk))
+                # generate, listen to the take, and re-record glitches (best of up to `takes`)
+                w, extra = voicecheck.best_take(generate, polish_chunk, chunk, sr, takes)
+                retakes += extra
+                if extra:
+                    job_update(job, retakes=retakes)
+                if abs(job["speed"] - 1.0) >= 0.01:
+                    w = time_stretch(w, sr, job["speed"])                  # gentle slow-down of the speech only
+                wavs.append(w)
+                if i < len(pieces) - 1 and pieces[i][1] > 0:
+                    # a human never pauses exactly the same length twice: vary each pause by about -20% / +25%
+                    gap = pieces[i][1] * random.uniform(0.8, 1.25)
+                    wavs.append(torch.zeros(1, int(gap * sr), dtype=w.dtype))
                 chars_done += len(chunk)
                 el = time.time() - t0
                 job_update(job, done=i + 1, elapsed=round(el),
@@ -418,14 +435,18 @@ def tts_worker():
                     fh.write(job["text"])
             except OSError:
                 pass
+            note = None
+            if job["quality"] > 1 and (not voicecheck.available() or voicecheck.last_error):
+                note = ("The listening check could not run, so single takes were used. "
+                        "Install it with: .venv\\Scripts\\python.exe -m pip install stable-ts")
             job_update(job, status="done", file=name, seconds=round(wav.shape[-1] / sr, 1),
-                       took=round(time.time() - t0))
+                       took=round(time.time() - t0), retakes=retakes, note=note)
         except RemoteError as e:
             job_update(job, status="error", error=str(e), remoteFailed=True)
         except Exception as e:
             job_update(job, status="error", error=f"Generation failed: {e}")
         finally:
-            if job.get("voice"):
+            if job.get("voice") and not job.get("voiceKeep"):
                 try:
                     os.remove(job["voice"])
                 except OSError:
@@ -724,6 +745,14 @@ class Handler(BaseHTTPRequestHandler):
                     "tts": [dict(job_snapshot(j), id=k) for k, j in tts_jobs.items() if j["status"] in ACTIVE],
                     "extract": [dict(job_snapshot(j), id=k) for k, j in ext_jobs.items() if j["status"] in ACTIVE],
                     "video": [dict(job_snapshot(j), id=k) for k, j in vid_jobs.items() if j["status"] in ACTIVE]})
+        if path == "/api/voices":
+            return self.send_json(voicelib.list_voices())
+        m = re.fullmatch(r"/api/voices/([a-f0-9]{12})\.wav", path)
+        if m:
+            vp = voicelib.voice_path(m.group(1))
+            if not vp:
+                raise ApiError(404, "Not found.")
+            return self.send_audio(vp)
         if path == "/api/video/styles":
             return self.send_json(video.list_styles())
         m = re.fullmatch(r"/api/video/styles/([a-z0-9_]+)/preview\.png", path)
@@ -888,11 +917,21 @@ class Handler(BaseHTTPRequestHandler):
             project = resolve_project(body.get("project"))
             try:
                 exaggeration = min(2.0, max(0.25, float(body.get("exaggeration", 0.5))))
-                cfg = min(1.0, max(0.0, float(body.get("cfg", 0.5))))
+                cfg = min(1.0, max(0.1, float(body.get("cfg", 0.5))))   # 0 breaks the model
+                speed = min(1.2, max(0.8, float(body.get("speed", 1.0))))
             except (TypeError, ValueError):
                 raise ApiError(400, "Invalid voice settings.")
+            try:
+                quality = min(3, max(1, int(body.get("quality", 1))))
+            except (TypeError, ValueError):
+                raise ApiError(400, "Invalid quality setting.")
+            lib_voice = None
+            if body.get("voice_id"):
+                lib_voice = voicelib.voice_path(str(body["voice_id"]))
+                if not lib_voice:
+                    raise ApiError(404, "That saved voice no longer exists. Pick another one.")
             voice_bytes = None
-            if body.get("voice"):
+            if body.get("voice") and not lib_voice:
                 try:
                     voice_bytes = base64.b64decode(str(body["voice"]), validate=True)
                 except (binascii.Error, ValueError):
@@ -907,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not (s["colab_url"] and s["colab_key"]):
                     raise ApiError(400, "Colab GPU is selected but not set up yet. Open Settings and add the Address and Key.")
                 remote = {"url": s["colab_url"], "key": s["colab_key"]}
-            voice_path = None
+            voice_path = lib_voice
             if voice_bytes:   # only written once everything else is validated
                 voice_path = os.path.join(VOICES, uuid.uuid4().hex + ".wav")
                 with open(voice_path, "wb") as fh:
@@ -915,11 +954,34 @@ class Handler(BaseHTTPRequestHandler):
             prune_jobs()
             jid = uuid.uuid4().hex
             with state_lock:
-                tts_jobs[jid] = dict(text=text, voice=voice_path, project=project, status="queued",
+                tts_jobs[jid] = dict(text=text, voice=voice_path, voiceKeep=bool(lib_voice), quality=quality,
+                                     project=project, status="queued",
                                      engine=engine, remote=remote,
-                                     done=0, total=0, exaggeration=exaggeration, cfg=cfg, created=time.time())
+                                     done=0, total=0, exaggeration=exaggeration, cfg=cfg, speed=speed,
+                                     created=time.time())
             tts_q.put(jid)
             return self.send_json({"id": jid})
+
+        if path == "/api/voices":
+            body = self.read_json()
+            try:
+                raw = base64.b64decode(str(body.get("data") or ""), validate=True)
+            except (binascii.Error, ValueError):
+                raise ApiError(400, "The voice file could not be read.")
+            if not raw or len(raw) > MAX_VOICE_BYTES:
+                raise ApiError(400 if not raw else 413, "Choose a .wav file (max 25 MB).")
+            if not (raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"):
+                raise ApiError(400, "The voice sample must be a .wav file.")
+            try:
+                return self.send_json(voicelib.add_voice(body.get("name"), raw))
+            except ValueError as e:
+                raise ApiError(400, str(e))
+
+        if path == "/api/voices/delete":
+            body = self.read_json()
+            if not voicelib.delete_voice(str(body.get("id") or "")):
+                raise ApiError(404, "Voice not found.")
+            return self.send_json({"ok": True})
 
         if path == "/api/video":
             body = self.read_json()
@@ -1053,6 +1115,19 @@ def disable_console_quickedit():
         pass
 
 
+def cleanup_stale_uploads():
+    """Remove temporary uploads (voice samples, video images) left behind by jobs that were interrupted.
+    The saved-voice library lives in a sub-folder and is never touched."""
+    try:
+        cutoff = time.time() - 3600
+        for f in os.listdir(VOICES):
+            fp = os.path.join(VOICES, f)
+            if os.path.isfile(fp) and f != ".gitkeep" and os.path.getmtime(fp) < cutoff:
+                os.remove(fp)
+    except OSError:
+        pass
+
+
 def cleanup_stale_videos():
     """Remove half-made videos (and 0-byte name reservations) left behind if the server was stopped mid-render."""
     try:
@@ -1071,6 +1146,7 @@ def cleanup_stale_videos():
 def main():
     disable_console_quickedit()
     cleanup_stale_videos()
+    cleanup_stale_uploads()
     for target in (tts_worker, extract_worker, video_worker):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
     try:
