@@ -1076,8 +1076,12 @@ async function pollVideo(id, project){
     if (j.status === 'error'){ bar.hidden = true; vidPollId = null; toast(j.error || 'Video creation failed.', 6000); return; }
     const label = {queued: 'Queued...', 'loading alignment model': 'Loading the alignment model...',
                    aligning: 'Matching the text to the audio...', rendering: 'Rendering video...'}[j.status] || 'Working...';
-    const pct = j.status === 'rendering' && j.total ? Math.round(j.done / j.total * 100) : 0;
-    $('vidStatus').textContent = label; $('vidProg').style.width = pct + '%'; $('vidPct').textContent = j.status === 'rendering' ? pct + '%' : '';
+    let pct = 0;
+    if (j.status === 'rendering' && j.total) pct = Math.round(j.done / j.total * 100);
+    else if (j.status === 'aligning' && j.alignTotal) pct = Math.round(j.alignDone / j.alignTotal * 100);
+    const showPct = (j.status === 'rendering' && j.total) || (j.status === 'aligning' && j.alignTotal);
+    $('vidStatus').textContent = label + (j.elapsed != null && j.status !== 'queued' ? ` (${fmt(j.elapsed)})` : '');
+    $('vidProg').style.width = pct + '%'; $('vidPct').textContent = showPct ? pct + '%' : '';
     await sleep(1500);
   }
 }

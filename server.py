@@ -170,7 +170,7 @@ def job_update(job, **fields):
 def job_snapshot(job):
     with state_lock:
         snap = {k: v for k, v in job.items() if k not in PRIVATE_KEYS}
-        if snap.get("status") == "generating" and "t0" in job:
+        if snap.get("status") in ("generating", "loading alignment model", "aligning", "rendering") and "t0" in job:
             snap["elapsed"] = round(time.time() - job["t0"])   # live clock between parts
         return snap
 
@@ -581,9 +581,13 @@ def video_worker():
             def on_progress(done, total):
                 job_update(job, done=done, total=total)
 
+            def on_align_progress(done, total):
+                job_update(job, alignDone=round(done, 1), alignTotal=round(total, 1))
+
             try:
                 seconds = video.make_video(job["style"], job["audio"], job["text"], os.path.join(vdir, name), options,
-                                           on_status=on_status, on_progress=on_progress)
+                                           on_status=on_status, on_progress=on_progress,
+                                           on_align_progress=on_align_progress)
             except BaseException:
                 try:
                     os.remove(os.path.join(vdir, name))   # drop the reserved placeholder
@@ -1033,7 +1037,40 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, "Not found.")
 
 
+def disable_console_quickedit():
+    """Windows console QuickEdit freezes any process that writes to the console as soon as the window is clicked
+    (until Enter is pressed) - which stalls jobs mid-way. Turn it off for this server's own console."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)   # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h, ctypes.byref(mode)):
+            k32.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)   # clear QUICK_EDIT, set EXTENDED_FLAGS
+    except Exception:
+        pass
+
+
+def cleanup_stale_videos():
+    """Remove half-made videos (and 0-byte name reservations) left behind if the server was stopped mid-render."""
+    try:
+        for proj in os.listdir(PROJECTS):
+            vdir = video_dir(proj)
+            if not os.path.isdir(vdir):
+                continue
+            for f in os.listdir(vdir):
+                fp = os.path.join(vdir, f)
+                if f.endswith(".part.mp4") or (f.lower().endswith(".mp4") and os.path.getsize(fp) == 0):
+                    os.remove(fp)
+    except OSError:
+        pass
+
+
 def main():
+    disable_console_quickedit()
+    cleanup_stale_videos()
     for target in (tts_worker, extract_worker, video_worker):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
     try:

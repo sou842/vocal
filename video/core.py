@@ -3,6 +3,8 @@
 A *style* is one class in video/styles/<name>.py, decorated with @register. It receives the aligned words and
 returns a PIL image for any time t; everything else (alignment, encoding, progress) is handled here.
 """
+import contextlib
+import io
 import os
 import subprocess
 import threading
@@ -66,7 +68,7 @@ def _alignment_model(name, device):
         return _models[(name, device)]
 
 
-def align_words(audio_path, text, model_name="base", on_status=None):
+def align_words(audio_path, text, model_name="base", on_status=None, on_align_progress=None):
     """Forced alignment of the known text to the audio (stable-ts / Whisper). Returns (words, duration)."""
     try:
         import soundfile as sf
@@ -83,7 +85,22 @@ def align_words(audio_path, text, model_name="base", on_status=None):
     model = _alignment_model(model_name, "cuda" if torch.cuda.is_available() else "cpu")
     if on_status:
         on_status("aligning")
-    result = model.align(audio16k, text, language="en")
+    def _progress(*a):   # stable-ts calls this with (seconds done, total seconds)
+        if on_align_progress and len(a) >= 2 and a[1]:
+            on_align_progress(float(a[0]), float(a[1]))
+
+    # verbose=None: print nothing. A progress bar on a Windows console can freeze the whole server if the
+    # console window is clicked (QuickEdit), so nothing is written while aligning.
+    prev = os.environ.get("TQDM_DISABLE")
+    os.environ["TQDM_DISABLE"] = "1"   # silences every progress bar the library still draws
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):   # some bars ignore the switch above
+            result = model.align(audio16k, text, language="en", verbose=None, progress_callback=_progress)
+    finally:
+        if prev is None:
+            os.environ.pop("TQDM_DISABLE", None)
+        else:
+            os.environ["TQDM_DISABLE"] = prev
     words = [{"w": w.word.strip(), "start": round(float(w.start), 3), "end": round(float(w.end), 3)}
              for seg in result.segments for w in seg.words if w.word.strip()]
     if not words:
@@ -128,11 +145,12 @@ def render(style_id, audio_path, words, duration, out_path, options=None, on_pro
         on_progress(n, n)
 
 
-def make_video(style_id, audio_path, text, out_path, options=None, on_status=None, on_progress=None):
+def make_video(style_id, audio_path, text, out_path, options=None, on_status=None, on_progress=None,
+               on_align_progress=None):
     """Convenience: align + render. Returns the duration in seconds."""
     if style_id not in STYLES:
         raise ValueError(f"Unknown video style: {style_id}")
-    words, duration = align_words(audio_path, text, on_status=on_status)
+    words, duration = align_words(audio_path, text, on_status=on_status, on_align_progress=on_align_progress)
     if on_status:
         on_status("rendering")
     render(style_id, audio_path, words, duration, out_path, options, on_progress)
