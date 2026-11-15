@@ -26,6 +26,9 @@ py -3.12 -m venv .venv
 # 3. Install the app's Python dependencies
 .venv\Scripts\python.exe -m pip install chatterbox-tts pymupdf4llm
 
+# 3b. (For making videos) alignment + video encoding
+.venv\Scripts\python.exe -m pip install stable-ts imageio-ffmpeg soundfile pillow
+
 # 4. (Optional) rebuild the CSS — a built copy is already committed, so this is only needed
 #    if you change web/input.css
 npm install
@@ -48,6 +51,12 @@ This opens `http://127.0.0.1:8000` in your browser once the server is ready. Lea
 - **Generate speech**: paste or type text, optionally attach a ~10 second voice sample to clone, and click Generate. Output is saved as `projects/<Project>/<Project>_<N>.wav`.
 - **Documents**: drop in a PDF to extract its text page by page. Extractions are saved, so re-uploading the same PDF reopens the saved copy instantly instead of re-processing it. Edit any page, search across the document, select pages, and send text straight to the script (with an optional "Clean for speech" pass that strips Markdown formatting).
 - **Audio library**: every generated file for the current project, with play/download.
+
+## Making videos
+
+Open the **Videos** page and click **New video** (or click **Create video** on a file in the Audio library). Pick the audio, a style, a theme color (purple, blue, teal, green, amber, rose), check the text (it is filled in from the script the audio was generated from), optionally upload your own left image, and create. The text is matched to the audio with Whisper (stable-ts), then rendered to a 1080p MP4 with word-by-word highlighting. Finished videos are listed on the Videos page.
+
+**Adding a style:** copy `video/styles/split_reader.py`, give the class a new `id`/`name`/`description`, implement `frame(t)` (return a 1920x1080 PIL image for time `t`), and add a preview image to `video/assets/previews/`. It shows up in the dialog after a restart — no other code to change.
 
 ## Faster generation with a Colab GPU (optional)
 
@@ -83,10 +92,16 @@ colab/
   worker.py           GPU worker (runs Chatterbox on a GPU, serves it over HTTP with an access key)
   vocal_worker.ipynb  Ready-to-run Colab notebook (generated from worker.py)
   make_notebook.py    Regenerates the notebook after editing worker.py
+video/            Read-along video styles (see "Making videos")
+  core.py             Word alignment, style registry, FFmpeg render loop
+  styles/<name>.py    One file per style (currently: split_reader)
+  assets/             Default artwork, style preview images
 settings.json     Speech engine choice + Colab address/key — local only, NOT committed
 projects/         Generated at runtime — NOT committed (see .gitignore)
   <Project>/
     <Project>_1.wav, <Project>_2.wav, ...
+    scripts/<Project>_<N>.txt               the text each audio was generated from
+    videos/<Project>_<N>_<style>.mp4        videos made from the audio
     documents/<id>/{doc.json, source.pdf}   saved PDF extractions
     texts/<name>.txt|.md                    text saved from the document viewer
 voices/           Temporary uploaded voice samples — NOT committed

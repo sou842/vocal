@@ -5,6 +5,8 @@ Run:  .venv\\Scripts\\python.exe server.py            (opens http://127.0.0.1:80
 
 Storage (everything lives under ./projects):
   projects/<Project>/<Project>_<N>.wav                      generated audio
+  projects/<Project>/scripts/<Project>_<N>.txt              the text each audio was generated from
+  projects/<Project>/videos/<Project>_<N>_<style>.mp4       read-along videos (see video/)
   projects/<Project>/texts/<name>.txt|.md                   text saved from a document
   projects/<Project>/documents/<id>/{doc.json, source.pdf}  saved PDF extractions (id = sha256 prefix)
 
@@ -36,6 +38,7 @@ import numpy as np
 import torch
 import torchaudio as ta
 
+import video
 from tts import split_text
 
 # ------------------------------------------------------------------ configuration
@@ -46,6 +49,7 @@ ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
 MAX_JSON_BYTES = 40 * 1024 * 1024      # generous: a voice sample travels base64-encoded in JSON
 MAX_PDF_BYTES = 300 * 1024 * 1024
 MAX_VOICE_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_SCRIPT_CHARS = 500_000
 CHUNK_CHARS = 150                      # text per TTS call; smaller = finer progress
 JOB_TTL_SECONDS = 3600                 # finished jobs are forgotten after this
@@ -121,12 +125,41 @@ def next_audio_name(project):
     return f"{project}_{max(nums, default=0) + 1}.wav"
 
 
+def script_path(project, audio_name):
+    """The text an audio file was generated from (needed later to align it for a video)."""
+    return os.path.join(project_dir(project), "scripts", os.path.splitext(audio_name)[0] + ".txt")
+
+
+def video_dir(project):
+    return os.path.join(project_dir(project), "videos")
+
+
+def list_videos(project):
+    d = video_dir(project)
+    if not os.path.isdir(d):
+        return []
+    files = [f for f in os.listdir(d) if f.lower().endswith(".mp4") and not f.endswith(".part.mp4")
+             and os.path.getsize(os.path.join(d, f)) > 0]   # a 0-byte file is a name reserved by a running job
+    return sorted(files, key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)   # newest first
+
+
+def next_video_name(project, audio_name, style_id):
+    stem = f"{os.path.splitext(audio_name)[0]}_{style_id}"
+    existing = {f.lower() for f in list_videos(project)}
+    name, n = stem + ".mp4", 1
+    while name.lower() in existing:
+        n += 1
+        name = f"{stem}_{n}.mp4"
+    return name
+
+
 # ------------------------------------------------------------------ jobs (shared between threads)
-state_lock = threading.RLock()    # guards tts_jobs / ext_jobs and every job dict inside them
-tts_jobs, ext_jobs = {}, {}
-tts_q, ext_q = queue.Queue(), queue.Queue()
-PRIVATE_KEYS = {"text", "voice", "data", "t0", "remote"}
-ACTIVE = {"queued", "loading model", "connecting", "generating", "extracting"}
+state_lock = threading.RLock()    # guards every job table and every job dict inside them
+tts_jobs, ext_jobs, vid_jobs = {}, {}, {}
+tts_q, ext_q, vid_q = queue.Queue(), queue.Queue(), queue.Queue()
+PRIVATE_KEYS = {"text", "voice", "data", "t0", "remote", "audio", "image"}
+ACTIVE = {"queued", "loading model", "connecting", "generating", "extracting",
+          "loading alignment model", "aligning", "rendering"}
 
 
 def job_update(job, **fields):
@@ -146,7 +179,7 @@ def prune_jobs():
     """Forget finished jobs after JOB_TTL_SECONDS so memory doesn't grow forever."""
     cutoff = time.time() - JOB_TTL_SECONDS
     with state_lock:
-        for table in (tts_jobs, ext_jobs):
+        for table in (tts_jobs, ext_jobs, vid_jobs):
             for jid in [k for k, j in table.items() if j["status"] not in ACTIVE and j.get("finished", 0) < cutoff]:
                 del table[jid]
 
@@ -379,6 +412,12 @@ def tts_worker():
             with audio_lock:
                 name = next_audio_name(job["project"])
                 ta.save(os.path.join(pdir, name), wav, sr)
+            try:   # keep the script next to the audio so a video can be made from it later
+                os.makedirs(os.path.dirname(script_path(job["project"], name)), exist_ok=True)
+                with open(script_path(job["project"], name), "w", encoding="utf-8") as fh:
+                    fh.write(job["text"])
+            except OSError:
+                pass
             job_update(job, status="done", file=name, seconds=round(wav.shape[-1] / sr, 1),
                        took=round(time.time() - t0))
         except RemoteError as e:
@@ -515,6 +554,55 @@ def extract_worker():
             ext_q.task_done()
 
 
+# ------------------------------------------------------------------ video creation
+def video_worker():
+    while True:
+        jid = vid_q.get()
+        with state_lock:
+            job = vid_jobs.get(jid)
+        if job is None:
+            vid_q.task_done()
+            continue
+        try:
+            vdir = video_dir(job["project"])
+            os.makedirs(vdir, exist_ok=True)
+            with audio_lock:   # reserve the name so two jobs never pick the same one
+                name = next_video_name(job["project"], job["audioName"], job["style"])
+                open(os.path.join(vdir, name), "ab").close()
+            t0 = time.time()
+            job_update(job, status="loading alignment model", t0=t0)
+            options = dict(job.get("options") or {})
+            if job.get("image"):
+                options["image"] = job["image"]
+
+            def on_status(s):
+                job_update(job, status=s)
+
+            def on_progress(done, total):
+                job_update(job, done=done, total=total)
+
+            try:
+                seconds = video.make_video(job["style"], job["audio"], job["text"], os.path.join(vdir, name), options,
+                                           on_status=on_status, on_progress=on_progress)
+            except BaseException:
+                try:
+                    os.remove(os.path.join(vdir, name))   # drop the reserved placeholder
+                except OSError:
+                    pass
+                raise
+            job_update(job, status="done", file=name, seconds=round(seconds, 1), took=round(time.time() - t0))
+        except Exception as e:
+            job_update(job, status="error", error=f"Video creation failed: {e}")
+        finally:
+            if job.get("image"):
+                try:
+                    os.remove(job["image"])
+                except OSError:
+                    pass
+            job_update(job, text=None, image=None, finished=time.time())
+            vid_q.task_done()
+
+
 # ------------------------------------------------------------------ HTTP
 class Handler(BaseHTTPRequestHandler):
     server_version = "VocalStudio/1.0"
@@ -630,7 +718,35 @@ class Handler(BaseHTTPRequestHandler):
             with state_lock:
                 return self.send_json({
                     "tts": [dict(job_snapshot(j), id=k) for k, j in tts_jobs.items() if j["status"] in ACTIVE],
-                    "extract": [dict(job_snapshot(j), id=k) for k, j in ext_jobs.items() if j["status"] in ACTIVE]})
+                    "extract": [dict(job_snapshot(j), id=k) for k, j in ext_jobs.items() if j["status"] in ACTIVE],
+                    "video": [dict(job_snapshot(j), id=k) for k, j in vid_jobs.items() if j["status"] in ACTIVE]})
+        if path == "/api/video/styles":
+            return self.send_json(video.list_styles())
+        m = re.fullmatch(r"/api/video/styles/([a-z0-9_]+)/preview\.png", path)
+        if m:
+            pp = video.preview_path(m.group(1))
+            if not pp:
+                raise ApiError(404, "Not found.")
+            with open(pp, "rb") as fh:
+                return self.send_body(200, fh.read(), "image/png")
+        if path.startswith("/api/video/jobs/"):
+            with state_lock:
+                job = vid_jobs.get(path.rsplit("/", 1)[1])
+            if not job:
+                raise ApiError(404, "This video job no longer exists (the server may have restarted).")
+            return self.send_json(job_snapshot(job))
+        if path == "/api/videos":
+            return self.send_json(list_videos(resolve_project(arg("project"))))
+        if path == "/api/script":   # the text an audio file was generated from ("" if unknown)
+            project = resolve_project(arg("project"))
+            fname = os.path.basename(arg("file"))
+            if number_of(project, fname) is None:
+                raise ApiError(404, "Audio file not found.")
+            try:
+                with open(script_path(project, fname), encoding="utf-8") as fh:
+                    return self.send_json({"text": fh.read()})
+            except OSError:
+                return self.send_json({"text": ""})
         if path.startswith("/api/jobs/"):
             with state_lock:
                 job = tts_jobs.get(path.rsplit("/", 1)[1])
@@ -653,16 +769,21 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Document not found.")
             return self.send_json(doc)
         if path.startswith("/projects/"):
-            parts = unquote(path).split("/")   # ['', 'projects', <project>, <file>]
+            parts = unquote(path).split("/")   # ['', 'projects', <project>, <file>]  or  [..., 'videos', <file>]
             if len(parts) == 4 and parts[3].lower().endswith(".wav"):
                 project = resolve_project(parts[2])
                 fname = os.path.basename(parts[3])
                 if number_of(project, fname) is not None:
                     return self.send_audio(os.path.join(project_dir(project), fname))
+            if len(parts) == 5 and parts[3] == "videos" and parts[4].lower().endswith(".mp4"):
+                project = resolve_project(parts[2])
+                fname = os.path.basename(parts[4])
+                if fname in list_videos(project):
+                    return self.send_audio(os.path.join(video_dir(project), fname), "video/mp4")
         raise ApiError(404, "Not found.")
 
-    def send_audio(self, fpath):
-        """Stream a .wav with HTTP Range support (needed for seeking in <audio>)."""
+    def send_audio(self, fpath, ctype="audio/wav"):
+        """Stream a .wav/.mp4 with HTTP Range support (needed for seeking in <audio>/<video>)."""
         if not os.path.isfile(fpath):
             raise ApiError(404, "Not found.")
         size = os.path.getsize(fpath)
@@ -684,7 +805,7 @@ class Handler(BaseHTTPRequestHandler):
             status = 206
         length = end - start + 1
         self.send_response(status)
-        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-store")
@@ -796,6 +917,54 @@ class Handler(BaseHTTPRequestHandler):
             tts_q.put(jid)
             return self.send_json({"id": jid})
 
+        if path == "/api/video":
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            fname = os.path.basename(str(body.get("file") or ""))
+            if number_of(project, fname) is None or not os.path.isfile(os.path.join(project_dir(project), fname)):
+                raise ApiError(404, "Audio file not found.")
+            style = str(body.get("style") or "")
+            if style not in video.STYLES:
+                raise ApiError(400, "Pick a video style.")
+            opts_in = body.get("options") if isinstance(body.get("options"), dict) else {}
+            options = {}
+            for o in video.STYLES[style].options:     # only options the style declares are accepted
+                if o["type"] == "theme":
+                    val = opts_in.get(o["key"], o["default"])
+                    if val not in {c["id"] for c in o["choices"]}:
+                        raise ApiError(400, "Unknown theme color.")
+                    options[o["key"]] = val
+            text = str(body.get("text") or "").strip()
+            if not text:
+                raise ApiError(400, "Enter the text that was spoken in this audio.")
+            if len(text) > MAX_SCRIPT_CHARS:
+                raise ApiError(413, f"The text is too long (max {MAX_SCRIPT_CHARS:,} characters).")
+            image_path = None
+            if body.get("image"):
+                try:
+                    img_bytes = base64.b64decode(str(body["image"]), validate=True)
+                except (binascii.Error, ValueError):
+                    raise ApiError(400, "The image could not be read.")
+                if len(img_bytes) > MAX_IMAGE_BYTES:
+                    raise ApiError(413, "The image is too large (max 25 MB).")
+                try:
+                    from PIL import Image
+                    with Image.open(io.BytesIO(img_bytes)) as im:
+                        im.verify()
+                except Exception:
+                    raise ApiError(400, "The image must be a PNG, JPG or WebP file.")
+                image_path = os.path.join(VOICES, uuid.uuid4().hex + ".img")   # temp upload, deleted after the job
+                with open(image_path, "wb") as fh:
+                    fh.write(img_bytes)
+            prune_jobs()
+            jid = uuid.uuid4().hex
+            with state_lock:
+                vid_jobs[jid] = dict(text=text, audio=os.path.join(project_dir(project), fname), audioName=fname,
+                                     image=image_path, options=options, project=project, style=style, status="queued",
+                                     done=0, total=0, created=time.time())
+            vid_q.put(jid)
+            return self.send_json({"id": jid})
+
         if path == "/api/extract":
             ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if ctype not in ("application/pdf", "application/octet-stream"):
@@ -865,7 +1034,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    for target in (tts_worker, extract_worker):
+    for target in (tts_worker, extract_worker, video_worker):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
     try:
         httpd = ThreadingHTTPServer((HOST, PORT), Handler)

@@ -210,8 +210,8 @@ async function refreshCounts(){
 }
 
 /* ================================================================ router */
-const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'settings'];
-const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', settings: 'Settings'};
+const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'videos', 'settings'];
+const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', videos: 'Videos', settings: 'Settings'};
 function show(view){
   VIEWS.forEach(v => { $('view-' + v).hidden = v !== view; });
   const nav = view === 'doc' ? 'documents' : view;
@@ -227,10 +227,11 @@ function route(){
   if (!curProject()){ show('empty'); $('crumbPage').textContent = 'Get started'; return; }
   const h = currentRoute();
   if (h.startsWith('doc/')){ show('doc'); openDoc(h.slice(4)); return; }
-  const v = ['generate', 'documents', 'audio', 'settings'].includes(h) ? h : 'generate';
+  const v = ['generate', 'documents', 'audio', 'videos', 'settings'].includes(h) ? h : 'generate';
   show(v);
   if (v === 'documents') loadDocs();
   if (v === 'audio') loadAudio();
+  if (v === 'videos') loadVideos();
   if (v === 'settings') loadSettings(true);
 }
 document.querySelectorAll('.nav-link').forEach(a => {
@@ -393,9 +394,11 @@ async function loadAudio(){
         <button class="grid size-9 shrink-0 cursor-pointer place-items-center rounded-lg border bg-muted transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-4" data-play data-ico title="Play" aria-label="Play ${esc(f)}">${ICON.play}</button>
         <span class="flex-1 truncate font-mono text-xs">${esc(f)}</span>
         <button class="btn btn-outline btn-sm" data-play data-lbl>Play</button>
+        <button class="btn btn-outline btn-sm" data-video>${lu('clapperboard')}<span class="hidden sm:inline">Create video</span></button>
         <a class="btn btn-outline btn-sm" href="${audioUrl(p, f)}" download>${ICON.dl}<span class="hidden sm:inline">Download</span></a>
       </div>
     </div>`).join('');
+  box.querySelectorAll('[data-video]').forEach(b => b.onclick = () => openVideoDialog(b.closest('[data-file]').dataset.file));
   const setRowState = (row, playing) => {
     row.querySelector('[data-ico]').innerHTML = playing ? lu('pause') : lu('play');
     row.querySelector('[data-ico]').title = playing ? 'Pause' : 'Play';
@@ -941,6 +944,175 @@ function showRemoteFallback(){
   };
 }
 
+/* ================================================================ video creation
+   Styles (and their options, e.g. theme colors) come from the server (video/styles/*.py),
+   so adding a style there makes it appear here automatically. */
+const videoUrl = (project, file) => '/projects/' + encodeURIComponent(project) + '/videos/' + encodeURIComponent(file);
+let vidStyles = null, vidImage = null, vidStyleId = store.get('videoStyle') || '', vidPollId = null, vidScriptSeq = 0;
+let vidThemes = {};   // style id -> chosen theme id
+try { vidThemes = JSON.parse(store.get('videoThemes') || '{}') || {}; } catch (e){ vidThemes = {}; }
+
+const readB64 = file => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1] || '');
+  r.onerror = () => rej(new Error('Could not read the file.'));
+  r.readAsDataURL(file);
+});
+
+function renderVideoStyles(){
+  const box = $('vidStyles');
+  box.innerHTML = vidStyles.map(st => `
+    <button type="button" data-style="${esc(st.id)}" class="cursor-pointer overflow-hidden rounded-lg border text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${st.id === vidStyleId ? 'border-primary ring-2 ring-primary' : ''}" aria-pressed="${st.id === vidStyleId}">
+      ${st.preview ? `<img class="aspect-video w-full object-cover" src="${esc(st.preview)}" alt="">` : ''}
+      <div class="p-3"><div class="font-medium">${esc(st.name)}</div><div class="hint">${esc(st.description)}</div></div>
+    </button>`).join('');
+  box.querySelectorAll('[data-style]').forEach(b => b.onclick = () => { vidStyleId = b.dataset.style; store.set('videoStyle', vidStyleId); vidImage = null; renderVideoStyles(); });
+  const st = vidStyles.find(x => x.id === vidStyleId);
+  $('vidOptions').innerHTML = ((st && st.options) || []).map(o => {
+    if (o.type === 'theme'){
+      const cur = vidThemes[st.id] && o.choices.some(c => c.id === vidThemes[st.id]) ? vidThemes[st.id] : o.default;
+      return `<div>
+        <div class="mb-2 flex justify-between"><span class="label">${esc(o.label)}</span><span id="vidThemeName" class="hint">${esc((o.choices.find(c => c.id === cur) || {}).label || '')}</span></div>
+        <div class="flex flex-wrap gap-2.5" role="radiogroup" aria-label="${esc(o.label)}">
+          ${o.choices.map(c => `<button type="button" role="radio" aria-checked="${c.id === cur}" aria-label="${esc(c.label)}" title="${esc(c.label)}" data-theme="${esc(c.id)}" data-tlabel="${esc(c.label)}"
+             class="size-9 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${c.id === cur ? 'border-foreground ring-2 ring-offset-2 ring-offset-card ring-foreground/40' : 'border-transparent'}"
+             style="background:${esc(c.color)}"></button>`).join('')}
+        </div></div>`;
+    }
+    if (o.type === 'image') return `
+      <div>
+        <div class="mb-2 flex justify-between"><label class="label" for="vidOpt_${esc(o.key)}">${esc(o.label)}</label><span class="hint">Optional</span></div>
+        <input id="vidOpt_${esc(o.key)}" data-opt="${esc(o.key)}" type="file" accept="image/png,image/jpeg,image/webp" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
+        <p class="hint mt-1.5">${esc(o.hint || '')}</p>
+      </div>`;
+    return '';
+  }).join('');
+  $('vidOptions').querySelectorAll('[data-opt]').forEach(i => i.onchange = () => { vidImage = i.files[0] || null; });
+  $('vidOptions').querySelectorAll('[data-theme]').forEach(b => b.onclick = () => {
+    vidThemes[st.id] = b.dataset.theme; store.set('videoThemes', JSON.stringify(vidThemes));
+    $('vidOptions').querySelectorAll('[data-theme]').forEach(x => {
+      const on = x === b;
+      x.setAttribute('aria-checked', on);
+      x.classList.toggle('border-foreground', on); x.classList.toggle('border-transparent', !on);
+      ['ring-2', 'ring-offset-2', 'ring-offset-card', 'ring-foreground/40'].forEach(c => x.classList.toggle(c, on));
+    });
+    $('vidThemeName').textContent = b.dataset.tlabel;
+  });
+}
+
+async function loadVidScript(file){
+  const seq = ++vidScriptSeq;
+  $('vidText').value = ''; $('vidTextHint').textContent = '';
+  if (!file) return;
+  try {
+    const r = await api.get(qp('/api/script', {project: curProject(), file}));
+    if (seq !== vidScriptSeq) return;
+    $('vidText').value = r.text || '';
+    $('vidTextHint').textContent = r.text ? 'Filled in from the text this audio was generated from.'
+      : 'This audio was made before scripts were saved. Paste its exact text.';
+  } catch (e){ /* leave empty */ }
+}
+
+/* Opens the "New video" dialog. `file` (optional) preselects an audio file. */
+async function openVideoDialog(file){
+  $('vidErr').hidden = true; vidImage = null; $('vidGo').disabled = false;
+  let files;
+  try {
+    if (!vidStyles) vidStyles = await api.get('/api/video/styles');
+    files = await api.get(qp('/api/files', {project: curProject()}));
+  } catch (e){ toast(e.message); return; }
+  if (!files.length){ toast('Generate some audio first, then make a video from it.'); return; }
+  if (!vidStyles.length){ toast('No video styles are installed.'); return; }
+  if (!vidStyles.some(x => x.id === vidStyleId)) vidStyleId = vidStyles[0].id;
+  $('vidAudio').innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+  $('vidAudio').value = files.includes(file) ? file : files[0];
+  renderVideoStyles();
+  $('videoDialog').showModal();
+  loadVidScript($('vidAudio').value);
+}
+$('vidAudio').onchange = () => loadVidScript($('vidAudio').value);
+$('vidCancel').onclick = () => $('videoDialog').close();
+$('newVideoBtn').onclick = () => openVideoDialog();
+$('videoForm').onsubmit = async ev => {
+  ev.preventDefault();
+  const err = $('vidErr'); err.hidden = true;
+  const text = $('vidText').value.trim();
+  if (!text){ err.textContent = 'Enter the text that was spoken in this audio.'; err.hidden = false; return; }
+  $('vidGo').disabled = true;
+  try {
+    const st = vidStyles.find(x => x.id === vidStyleId);
+    const options = {};
+    ((st && st.options) || []).filter(o => o.type === 'theme').forEach(o => {
+      const t = vidThemes[st.id];
+      options[o.key] = t && o.choices.some(c => c.id === t) ? t : o.default;
+    });
+    const body = {project: curProject(), file: $('vidAudio').value, style: vidStyleId, text, options};
+    if (vidImage) body.image = await readB64(vidImage);
+    const j = await api.post('/api/video', body);
+    $('videoDialog').close();
+    if (currentRoute() !== 'videos') location.hash = '#/videos';
+    pollVideo(j.id, curProject());
+  } catch (e){ err.textContent = e.message; err.hidden = false; $('vidGo').disabled = false; }
+};
+
+async function pollVideo(id, project){
+  vidPollId = id;
+  const bar = $('vidActive');
+  bar.hidden = false; $('vidProg').style.width = '0%'; $('vidPct').textContent = ''; $('vidStatus').textContent = 'Queued...';
+  let failures = 0;
+  while (vidPollId === id){
+    let j;
+    try { j = await api.get('/api/video/jobs/' + encodeURIComponent(id)); failures = 0; }
+    catch (e){
+      if (e.network && ++failures < 8){ await sleep(2000); continue; }
+      bar.hidden = true; vidPollId = null; toast('Video: ' + e.message); return;
+    }
+    if (j.status === 'done'){
+      bar.hidden = true; vidPollId = null;
+      toast('Video ready: ' + j.file);
+      if (currentRoute() === 'videos' && curProject() === project) loadVideos();
+      return;
+    }
+    if (j.status === 'error'){ bar.hidden = true; vidPollId = null; toast(j.error || 'Video creation failed.', 6000); return; }
+    const label = {queued: 'Queued...', 'loading alignment model': 'Loading the alignment model...',
+                   aligning: 'Matching the text to the audio...', rendering: 'Rendering video...'}[j.status] || 'Working...';
+    const pct = j.status === 'rendering' && j.total ? Math.round(j.done / j.total * 100) : 0;
+    $('vidStatus').textContent = label; $('vidProg').style.width = pct + '%'; $('vidPct').textContent = j.status === 'rendering' ? pct + '%' : '';
+    await sleep(1500);
+  }
+}
+
+let videoLoadSeq = 0;
+async function loadVideos(){
+  const p = curProject(), seq = ++videoLoadSeq;
+  const box = $('videoList');
+  let files;
+  try { files = await api.get(qp('/api/videos', {project: p})); }
+  catch (e){ if (seq === videoLoadSeq) box.innerHTML = `<div class="px-5 py-12 text-center text-destructive">${esc(e.message)}</div>`; return; }
+  if (seq !== videoLoadSeq) return;
+  if (!files.length){
+    box.innerHTML = `<div class="px-5 py-12 text-center text-muted-foreground">No videos yet. Click <b>New video</b> to make one from your audio.</div>`;
+    return;
+  }
+  box.innerHTML = files.map(f => `
+    <div class="p-4 md:px-5" data-vfile="${esc(f)}">
+      <div class="flex items-center gap-3">
+        <span class="flex-1 truncate font-mono text-xs">${esc(f)}</span>
+        <button class="btn btn-outline btn-sm" data-vplay>${ICON.play}Watch</button>
+        <a class="btn btn-outline btn-sm" href="${videoUrl(p, f)}" download>${ICON.dl}<span class="hidden sm:inline">Download</span></a>
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('[data-vplay]').forEach(b => b.onclick = () => {
+    const row = b.closest('[data-vfile]');
+    const old = row.querySelector('video');
+    if (old){ old.pause(); old.remove(); return; }
+    const v = document.createElement('video');
+    v.controls = true; v.autoplay = true; v.className = 'mt-3 w-full rounded-lg bg-black';
+    v.src = videoUrl(p, row.dataset.vfile);
+    row.appendChild(v);
+  });
+}
+
 /* ================================================================ re-attach to running jobs after a reload */
 async function resumeActiveJobs(){
   let a;
@@ -951,6 +1123,8 @@ async function resumeActiveJobs(){
     setStatus('Re-attached to a running job...');
     pollTts(t.id);
   }
+  const v = a.video && a.video[0];
+  if (v && !vidPollId) pollVideo(v.id, v.project);
   const x = a.extract && a.extract[0];
   if (x && !extracting){
     extracting = true;
