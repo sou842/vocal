@@ -1,8 +1,9 @@
 """Style "Split Reader": darkened illustration on the left, sentence-by-sentence text on the right."""
+import colorsys
 import os
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from ..core import ASSETS, H, W, Style, register
 
@@ -10,16 +11,36 @@ F = r"C:\Windows\Fonts"
 SERIF, SANS = F + r"\georgia.ttf", F + r"\segoeui.ttf"
 
 PANEL_W = 900                                   # left illustration panel
-# Theme palettes. hue = target hue of the artwork in degrees (the bundled art is purple, ~255).
-# bg = panel background, accent = word being spoken / progress, spoken/upcoming = current sentence, dim = other sentences.
-THEMES = {
-    "purple": dict(label="Purple", hue=255, bg=(13, 11, 26), accent=(190, 160, 255), spoken=(240, 234, 255), upcoming=(150, 136, 196), dim=(86, 80, 112)),
-    "blue":   dict(label="Blue",   hue=215, bg=(10, 16, 30), accent=(140, 190, 255), spoken=(232, 241, 255), upcoming=(124, 152, 200), dim=(72, 88, 116)),
-    "teal":   dict(label="Teal",   hue=175, bg=(8, 22, 24),  accent=(110, 226, 210), spoken=(228, 252, 248), upcoming=(112, 176, 170), dim=(66, 100, 100)),
-    "green":  dict(label="Green",  hue=135, bg=(10, 22, 14), accent=(150, 230, 150), spoken=(236, 252, 236), upcoming=(128, 176, 128), dim=(72, 100, 76)),
-    "amber":  dict(label="Amber",  hue=35,  bg=(28, 19, 9),  accent=(255, 196, 110), spoken=(255, 244, 228), upcoming=(200, 162, 118), dim=(112, 92, 70)),
-    "rose":   dict(label="Rose",   hue=335, bg=(28, 11, 20), accent=(255, 150, 190), spoken=(255, 236, 244), upcoming=(200, 128, 156), dim=(112, 76, 92)),
-}
+# Theme palettes: one per Tailwind color (accent = its 300 shade). Everything else is derived from the accent:
+# bg = panel background, spoken/upcoming = current sentence, dim = other sentences, hue/sat = recoloring of the artwork.
+# The bundled art is purple (hue ~255). "sat" scales the art's saturation (neutral colors are nearly gray).
+_TAILWIND = [   # id, label, accent RGB, art saturation
+    ("red", "Red", (252, 165, 165), 1), ("orange", "Orange", (253, 186, 116), 1), ("amber", "Amber", (252, 211, 77), 1),
+    ("yellow", "Yellow", (253, 224, 71), 1), ("lime", "Lime", (190, 242, 100), 1), ("green", "Green", (134, 239, 172), 1),
+    ("emerald", "Emerald", (110, 231, 183), 1), ("teal", "Teal", (94, 234, 212), 1), ("cyan", "Cyan", (103, 232, 249), 1),
+    ("sky", "Sky", (125, 211, 252), 1), ("blue", "Blue", (147, 197, 253), 1), ("indigo", "Indigo", (165, 180, 252), 1),
+    ("violet", "Violet", (196, 181, 253), 1), ("purple", "Purple", (216, 180, 254), 1),
+    ("fuchsia", "Fuchsia", (240, 171, 252), 1), ("pink", "Pink", (249, 168, 212), 1), ("rose", "Rose", (253, 164, 175), 1),
+    ("slate", "Slate", (203, 213, 225), 0.30), ("gray", "Gray", (209, 213, 219), 0.18), ("zinc", "Zinc", (212, 212, 216), 0.12),
+    ("neutral", "Neutral", (212, 212, 212), 0.0), ("stone", "Stone", (214, 211, 209), 0.14),
+]
+
+
+def _rgb(h, l, s):
+    return tuple(round(c * 255) for c in colorsys.hls_to_rgb(h, l, s))
+
+
+def _make_theme(label, accent, sat):
+    h, _, s = colorsys.rgb_to_hls(*(c / 255 for c in accent))
+    return dict(label=label, hue=h * 360, sat=sat, accent=accent,
+                bg=_rgb(h, 0.075, min(s, 0.5)), spoken=_rgb(h, 0.95, min(s, 1) * 0.9),
+                upcoming=_rgb(h, 0.62, min(s, 1) * 0.30), dim=_rgb(h, 0.36, min(s, 1) * 0.16))
+
+
+THEMES = {i: _make_theme(lb, ac, st) for i, lb, ac, st in _TAILWIND}
+# The original hand-tuned purple stays the default look (the artwork's own hue, so it is never recolored).
+THEMES["purple"] = dict(label="Purple", hue=255, sat=1, bg=(13, 11, 26), accent=(190, 160, 255), spoken=(240, 234, 255),
+                        upcoming=(150, 136, 196), dim=(86, 80, 112))
 DEFAULT_THEME = "purple"
 TX0, TX1 = PANEL_W + 90, W - 110
 FONT_SIZE, LINE_H, PARA_GAP = 50, 80, 44
@@ -61,11 +82,13 @@ class SplitReader(Style):
     # ---- static background
     def _build_base(self, image_path):
         im = Image.open(image_path).convert("RGB")
-        if image_path == DEFAULT_IMAGE and self.t["hue"] != THEMES[DEFAULT_THEME]["hue"]:
-            # recolor the bundled purple art to the theme (rotate the hue; uploaded images are left as they are)
+        if image_path == DEFAULT_IMAGE and self.t is not THEMES[DEFAULT_THEME]:
+            # recolor the bundled purple art to the theme: rotate the hue, scale the saturation
+            # (uploaded images are left as they are)
             shift = round((self.t["hue"] - THEMES[DEFAULT_THEME]["hue"]) / 360 * 256) % 256
             hsv = np.asarray(im.convert("HSV")).copy()
             hsv[..., 0] = (hsv[..., 0].astype(np.int16) + shift) % 256
+            hsv[..., 1] = (hsv[..., 1] * self.t["sat"]).astype(np.uint8)
             im = Image.fromarray(hsv, "HSV").convert("RGB")
         r = PANEL_W / im.width
         im = im.resize((PANEL_W, max(H, round(im.height * r))), Image.LANCZOS)
@@ -138,17 +161,6 @@ class SplitReader(Style):
         d.text((x0, y + 18), _fmt(t), font=self.small, fill=(210, 200, 235, 255))
         d.text((x1, y + 18), _fmt(self.duration), font=self.small, fill=(210, 200, 235, 255), anchor="ra")
 
-    def _pause(self, layer, t):
-        cx, cy = PANEL_W // 2, H - 220
-        pulse = 0.5 + 0.5 * np.sin(t * 2.2)
-        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).ellipse([cx - 70, cy - 70, cx + 70, cy + 70], fill=self.t["accent"] + (int(40 + 30 * pulse),))
-        layer.alpha_composite(glow.filter(ImageFilter.GaussianBlur(22)))
-        d = ImageDraw.Draw(layer)
-        d.ellipse([cx - 46, cy - 46, cx + 46, cy + 46], fill=(20, 16, 40, 200), outline=self.t["accent"] + (255,), width=3)
-        for ox in (-10, 10):
-            d.rounded_rectangle([cx + ox - 5, cy - 17, cx + ox + 5, cy + 17], radius=3, fill=(255, 255, 255, 255))
-
     # ---- one frame
     def frame(self, t):
         k, scroll = self._scroll(t)
@@ -172,6 +184,5 @@ class SplitReader(Style):
         a = np.asarray(layer).copy()
         a[..., 3] = (a[..., 3] * self.mask).astype(np.uint8)       # fade the top/bottom of the text column
         layer = Image.fromarray(a)
-        self._pause(layer, t)
         self._player(ImageDraw.Draw(layer), t)
         return Image.alpha_composite(self.base, layer)
