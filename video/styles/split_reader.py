@@ -7,8 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..core import ASSETS, H, W, Style, register
 
-F = r"C:\Windows\Fonts"
-SERIF, SANS = F + r"\georgia.ttf", F + r"\segoeui.ttf"
+SERIF = r"C:\Windows\Fonts\georgia.ttf"
 
 PANEL_W = 900                                   # left illustration panel
 # Theme palettes: one per Tailwind color (accent = its 300 shade). Everything else is derived from the accent:
@@ -52,11 +51,6 @@ def _font(p, s):
     return ImageFont.truetype(p, s)
 
 
-def _fmt(s):
-    s = int(s)
-    return f"{s // 60:02d}:{s % 60:02d}"
-
-
 @register
 class SplitReader(Style):
     id = "split_reader"
@@ -74,7 +68,6 @@ class SplitReader(Style):
         super().__init__(words, duration, options)
         self.t = THEMES.get(options.get("theme"), THEMES[DEFAULT_THEME])
         self.cap_font = _font(SERIF, FONT_SIZE)
-        self.small = _font(SANS, 22)
         self.base = self._build_base(options.get("image") or DEFAULT_IMAGE)
         self.sents = self._layout()
         self.mask = self._fade_mask()
@@ -150,17 +143,6 @@ class SplitReader(Style):
         p = p * p * (3 - 2 * p)
         return k, prev + (tops[k] - prev) * p
 
-    # ---- overlays
-    def _player(self, d, t):
-        x0, x1, y = 70, PANEL_W - 70, H - 92
-        p = min(1, t / self.duration) if self.duration else 0
-        d.rounded_rectangle([x0, y - 3, x1, y + 3], radius=3, fill=(255, 255, 255, 55))
-        xp = x0 + (x1 - x0) * p
-        d.rounded_rectangle([x0, y - 3, max(x0 + 6, xp), y + 3], radius=3, fill=self.t["accent"] + (255,))
-        d.ellipse([xp - 8, y - 8, xp + 8, y + 8], fill=(255, 255, 255, 255))
-        d.text((x0, y + 18), _fmt(t), font=self.small, fill=(210, 200, 235, 255))
-        d.text((x1, y + 18), _fmt(self.duration), font=self.small, fill=(210, 200, 235, 255), anchor="ra")
-
     # ---- one frame
     def frame(self, t):
         k, scroll = self._scroll(t)
@@ -184,5 +166,4 @@ class SplitReader(Style):
         a = np.asarray(layer).copy()
         a[..., 3] = (a[..., 3] * self.mask).astype(np.uint8)       # fade the top/bottom of the text column
         layer = Image.fromarray(a)
-        self._player(ImageDraw.Draw(layer), t)
         return Image.alpha_composite(self.base, layer)
