@@ -11,9 +11,11 @@ node_modules/
 projects/
 # Legacy output folder from early versions:
 outputs/
-# Uploaded voice-clone samples (temporary):
+# Uploaded voice-clone samples (temporary) are ignored, but the saved
+# narrator library (voices/library/) is kept in git on purpose.
 voices/*
 !voices/.gitkeep
+!voices/library/
 # Local test output:
 test.wav
 

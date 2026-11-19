@@ -7,8 +7,11 @@ Local, single-user Windows web app (http://127.0.0.1:8000) for **text to speech*
 - CSS: `npm run build:css` after adding Tailwind classes (`web/app.css` is committed). Web files are read per request (browser refresh); Python changes need a server restart.
 - Fonts for videos are Windows system fonts (Georgia), so video creation is Windows-only.
 
+## Saved voices (IN git)
+`voices/library/` (narrator clips, e.g. "Mr. Writer") is committed on purpose so voices carry to other devices. Other files in `voices/` stay ignored.
+
 ## Per-device data (NOT in git)
-`projects/` (audio, `scripts/`, `videos/`, documents), `voices/library/` (saved narrator clips, e.g. "Mr. Writer"), and `settings.json` (engine choice plus the Colab address/key, which change every Colab session; never print the key). On a new device, re-add the narrator voice in the Generate page ("Add voice") and set up the engine in Settings.
+`projects/` (audio, `scripts/`, `videos/`, documents), `settings.json` (engine choice plus the Colab address/key, which change every Colab session; never print the key). On a new device, re-add the narrator voice in the Generate page ("Add voice") and set up the engine in Settings.
 
 ## How it fits together
 - `server.py`: one worker thread per job type (`tts_worker`, `extract_worker`, `video_worker`). Jobs are in-memory dicts polled by the UI (`/api/jobs/<id>`, `/api/extract/<id>`, `/api/video/jobs/<id>`); `/api/active` lets a reloaded page re-attach. Startup disables Windows console QuickEdit and removes stale uploads and half-made videos.
