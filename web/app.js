@@ -216,6 +216,7 @@ function setCrumb(text){ $('crumbPage').textContent = text; $('crumbPage').title
 function show(view){
   VIEWS.forEach(v => { $('view-' + v).hidden = v !== view; });
   document.querySelector('main').style.maxWidth = view === 'editor' ? 'none' : '';   // the editor uses the whole width
+  document.documentElement.classList.toggle('no-scrollbar', view === 'editor');        // and shows no scrollbars (it still scrolls)
   const nav = view === 'doc' ? 'documents' : view;
   document.querySelectorAll('.nav-link').forEach(a => {
     a.classList.toggle('active', a.dataset.route === nav);

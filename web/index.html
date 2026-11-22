@@ -39,12 +39,16 @@
     <!-- Project switcher -->
     <div class="relative shrink-0 border-b border-sidebar-border p-3">
       <div class="sb-hide">
-        <div class="mb-1.5 px-1 text-xs font-medium text-muted-foreground">Project</div>
-        <div class="flex gap-2">
-          <select id="project" class="input h-8 min-w-0 bg-background"></select>
-          <button id="newProjBtn" class="btn btn-outline btn-sm btn-icon size-8 shrink-0" title="New project" aria-label="New project">
-            <i data-lucide="plus"></i>
+        <div class="mb-2 flex items-center justify-between px-1">
+          <span class="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Project</span>
+          <button id="newProjBtn" type="button" class="inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" title="New project" aria-label="New project">
+            <i data-lucide="plus" class="size-3.5"></i>New
           </button>
+        </div>
+        <div class="relative">
+          <i data-lucide="folder-open" class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"></i>
+          <select id="project" class="input h-10 min-w-0 cursor-pointer appearance-none rounded-lg bg-background pl-9 pr-9 font-medium" aria-label="Project"></select>
+          <i data-lucide="chevrons-up-down" class="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"></i>
         </div>
         <form id="newProjForm" class="mt-2 flex gap-2" hidden>
           <input id="newName" class="input h-8 min-w-0 bg-background" placeholder="e.g. Alfa" maxlength="40" autocomplete="off">
@@ -422,7 +426,7 @@
       </section>
 
       <!-- ============ Editor ============ -->
-      <section id="view-editor" hidden>
+      <section id="view-editor" class="no-scrollbar" hidden>
         <div class="flex flex-col gap-3" style="min-height: calc(100vh - 6.5rem)">
           <!-- top bar -->
           <div class="flex flex-wrap items-center justify-between gap-3">
@@ -445,20 +449,20 @@
           </div>
 
           <!-- stage: tools | preview | panel -->
-          <div class="grid gap-3 lg:grid-cols-[3.5rem_minmax(0,1fr)_21rem]" style="height: clamp(18rem, 46vh, 32rem)">
+          <div class="grid items-start gap-3 lg:grid-cols-[3.5rem_minmax(0,1fr)_21rem]">
             <div class="card flex items-center gap-1.5 p-1.5 lg:flex-col lg:justify-start" role="tablist" aria-label="Editor tools">
               <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clips" title="Your clips" aria-label="Your clips"><i data-lucide="film"></i></button>
               <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="audio" title="Audio: narration and music" aria-label="Audio"><i data-lucide="music"></i></button>
               <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clip" title="Selected clip" aria-label="Selected clip"><i data-lucide="sliders-horizontal"></i></button>
               <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="finish" title="Finish and export" aria-label="Finish and export"><i data-lucide="download"></i></button>
             </div>
-            <div class="relative min-h-0 overflow-hidden rounded-xl border bg-black">
+            <div class="relative mx-auto w-full overflow-hidden rounded-xl border bg-black" style="max-width: calc(46vh * 16 / 9); aspect-ratio: 16 / 9">
               <video id="edV0" class="absolute inset-0 size-full object-contain" preload="auto" playsinline></video>
               <video id="edV1" class="pointer-events-none absolute inset-0 size-full object-contain opacity-0" preload="auto" playsinline></video>
               <div id="edEmpty" class="absolute inset-0 grid place-items-center px-6 text-center text-sm text-white/70" hidden>Add clips from <b class="mx-1">Your clips</b> to start editing.</div>
               <div id="edClock" class="pointer-events-none absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-1 font-mono text-xs text-white tabular-nums"></div>
             </div>
-            <div id="edPanel" class="card min-h-0 overflow-y-auto"></div>
+            <div class="relative self-stretch" style="min-height: 16rem"><div id="edPanel" class="card absolute inset-0 overflow-y-auto"></div></div>
             <input type="file" id="edMusicFile" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*" hidden>
           </div>
 
