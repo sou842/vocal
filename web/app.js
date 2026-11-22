@@ -390,11 +390,44 @@ async function pollTts(id){
 
 /* ================================================================ audio library */
 let audioLoadSeq = 0;
+/* a name edited in place: the holder shows an input with Save / Cancel; onSave(text) does the work and may throw */
+function inlineRename(holder, {value, placeholder = '', suffix = '', maxlength = 60, onSave}){
+  const old = holder.innerHTML;
+  holder.innerHTML = `<form class="flex items-center gap-2">
+    <input class="input h-8 min-w-0 flex-1" maxlength="${maxlength}" placeholder="${esc(placeholder)}" value="${esc(value)}" aria-label="New name" autocomplete="off">
+    ${suffix ? `<span class="hint">${esc(suffix)}</span>` : ''}
+    <button class="btn btn-primary btn-sm" type="submit">Save</button>
+    <button class="btn btn-ghost btn-sm" type="button" data-cancel>Cancel</button></form>`;
+  const form = holder.firstElementChild, input = form.querySelector('input');
+  input.focus(); input.select();
+  const cancel = () => { holder.innerHTML = old; };
+  form.querySelector('[data-cancel]').onclick = cancel;
+  input.addEventListener('keydown', e => { if (e.key === 'Escape'){ e.preventDefault(); cancel(); } });
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const btn = form.querySelector('[type=submit]');
+    btn.disabled = true;
+    try { await onSave(input.value.trim()); } catch (err){ toast(err.message, 5000); btn.disabled = false; }
+  };
+}
+const renameBtn = (attr, label) => `<button type="button" class="btn btn-ghost btn-icon btn-sm shrink-0" ${attr} title="Rename" aria-label="Rename ${esc(label)}">${lu('pencil')}</button>`;
+/* an audio file shows its display name (if it has one) with the real file name underneath */
+function audioNameHtml(f, label){
+  return `<div class="flex min-w-0 items-center gap-1.5"><div class="min-w-0">
+      <div class="truncate ${label ? 'text-sm font-medium' : 'font-mono text-xs'}" title="${esc(label || f)}">${esc(label || f)}</div>
+      ${label ? `<div class="truncate font-mono text-[11px] text-muted-foreground">${esc(f)}</div>` : ''}
+    </div>${renameBtn('data-rename', f)}</div>`;
+}
+const safeDownloadName = (name, ext) => (name.replace(/[^\w .()-]/g, '_').trim() || 'audio') + ext;
+
 async function loadAudio(){
   const p = curProject(), seq = ++audioLoadSeq;
   const box = $('audioList');
-  let files;
-  try { files = await api.get(qp('/api/files', {project: p})); }
+  let files, names = {};
+  try {
+    [files, names] = await Promise.all([api.get(qp('/api/files', {project: p})),
+                                        api.get(qp('/api/audio-names', {project: p})).catch(() => ({}))]);
+  }
   catch (e){ if (seq === audioLoadSeq) box.innerHTML = `<div class="px-5 py-12 text-center text-destructive">${esc(e.message)}</div>`; return; }
   if (seq !== audioLoadSeq) return;
   if (!files.length){
@@ -405,12 +438,24 @@ async function loadAudio(){
     <div class="p-4 md:px-5" data-file="${esc(f)}">
       <div class="flex items-center gap-3">
         <button class="grid size-9 shrink-0 cursor-pointer place-items-center rounded-lg border bg-muted transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-4" data-play data-ico title="Play" aria-label="Play ${esc(f)}">${ICON.play}</button>
-        <span class="flex-1 truncate font-mono text-xs">${esc(f)}</span>
+        <div class="min-w-0 flex-1" data-namebox>${audioNameHtml(f, names[f])}</div>
         <button class="btn btn-outline btn-sm" data-play data-lbl>Play</button>
         <button class="btn btn-outline btn-sm" data-video>${lu('clapperboard')}<span class="hidden sm:inline">Create video</span></button>
-        <a class="btn btn-outline btn-sm" href="${audioUrl(p, f)}" download>${ICON.dl}<span class="hidden sm:inline">Download</span></a>
+        <a class="btn btn-outline btn-sm" href="${audioUrl(p, f)}" download="${esc(safeDownloadName(names[f] || f.replace(/\.wav$/i, ''), '.wav'))}">${ICON.dl}<span class="hidden sm:inline">Download</span></a>
       </div>
     </div>`).join('');
+  box.onclick = ev => {   // rename: gives the audio a display name (the numbered file name stays, the app relies on it)
+    const b = ev.target.closest('[data-rename]');
+    if (!b) return;
+    const row = b.closest('[data-file]'), f = row.dataset.file, holder = row.querySelector('[data-namebox]');
+    inlineRename(holder, {value: names[f] || '', placeholder: f + ' (leave empty to use the file name)', maxlength: 60, onSave: async name => {
+      await api.post('/api/audio/rename', {project: p, file: f, name});
+      if (name) names[f] = name; else delete names[f];
+      holder.innerHTML = audioNameHtml(f, names[f]);
+      row.querySelector('a[download]').setAttribute('download', safeDownloadName(names[f] || f.replace(/\.wav$/i, ''), '.wav'));
+      toast(name ? 'Name saved' : 'Back to the file name');
+    }});
+  };
   box.querySelectorAll('[data-video]').forEach(b => b.onclick = () => openVideoDialog(b.closest('[data-file]').dataset.file));
   const setRowState = (row, playing) => {
     row.querySelector('[data-ico]').innerHTML = playing ? lu('pause') : lu('play');
@@ -1311,15 +1356,16 @@ async function loadVidScript(file){
 /* Opens the "New video" dialog. `file` (optional) preselects an audio file. */
 async function openVideoDialog(file){
   $('vidErr').hidden = true; vidImage = null; $('vidGo').disabled = false;
-  let files;
+  let files, names = {};
   try {
     if (!vidStyles) vidStyles = await api.get('/api/video/styles');
     files = await api.get(qp('/api/files', {project: curProject()}));
+    names = await api.get(qp('/api/audio-names', {project: curProject()})).catch(() => ({}));
   } catch (e){ toast(e.message); return; }
   if (!files.length){ toast('Generate some audio first, then make a video from it.'); return; }
   if (!vidStyles.length){ toast('No video styles are installed.'); return; }
   if (!vidStyles.some(x => x.id === vidStyleId)) vidStyleId = vidStyles[0].id;
-  $('vidAudio').innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+  $('vidAudio').innerHTML = files.map(f => `<option value="${esc(f)}">${esc(names[f] ? names[f] + ' · ' + f : f)}</option>`).join('');
   $('vidAudio').value = files.includes(file) ? file : files[0];
   renderVideoStyles();
   $('videoDialog').showModal();
@@ -1393,11 +1439,21 @@ async function loadVideos(){
   box.innerHTML = files.map(f => `
     <div class="p-4 md:px-5" data-vfile="${esc(f)}">
       <div class="flex items-center gap-3">
-        <span class="flex-1 truncate font-mono text-xs">${esc(f)}</span>
+        <div class="flex min-w-0 flex-1 items-center gap-1.5" data-vnamebox><span class="truncate font-mono text-xs" title="${esc(f)}">${esc(f)}</span>${renameBtn('data-vrename', f)}</div>
         <button class="btn btn-outline btn-sm" data-vplay>${ICON.play}Watch</button>
         <a class="btn btn-outline btn-sm" href="${videoUrl(p, f)}" download>${ICON.dl}<span class="hidden sm:inline">Download</span></a>
       </div>
     </div>`).join('');
+  box.onclick = ev => {
+    const b = ev.target.closest('[data-vrename]');
+    if (!b) return;
+    const f = b.closest('[data-vfile]').dataset.vfile;
+    inlineRename(b.closest('[data-vnamebox]'), {value: f.replace(/\.mp4$/i, ''), suffix: '.mp4', maxlength: 80, onSave: async name => {
+      const r = await api.post('/api/video/rename', {project: p, file: f, name});
+      toast('Renamed to ' + r.file);
+      loadVideos();
+    }});
+  };
   box.querySelectorAll('[data-vplay]').forEach(b => b.onclick = () => {
     const row = b.closest('[data-vfile]');
     const old = row.querySelector('video');
@@ -1428,6 +1484,7 @@ const edL = () => EC.layout(ed.tl, ed.lib);
 const edClip = i => ed.tl.clips[i];
 const edAudioUrl = a => '/projects/' + encodeURIComponent(curProject()) + (a.src === 'music' ? '/music/' : '/') + encodeURIComponent(a.file);
 const edWave = a => qp('/api/editor/wave', {project: curProject(), src: a.src, file: a.file}) + '&v=' + (EC.aDur(ed.alib, a) || 0);
+const edAudioName = a => ((ed.audioFiles.find(x => x.src === a.src && x.file === a.file) || {}).label) || a.file;   // display name, else the file
 const edVol = c => (c && c.volume != null ? c.volume : 1);
 const edPct = v => Math.round(v * 100);
 const edPctText = v => (v < 0.005 ? 'Muted' : edPct(v) + '%');
@@ -1613,7 +1670,7 @@ function edRenderAudio(){
 function edAudioLabels(){
   document.querySelectorAll('[data-alabel]').forEach(el => {
     const a = (ed.tl.audio || [])[+el.dataset.alabel];
-    if (a) el.textContent = `${a.file.replace(/\.[^.]+$/, '')} · ${edPctText(a.volume)}`;
+    if (a){ const nm = edAudioName(a); el.textContent = `${nm === a.file ? nm.replace(/\.[^.]+$/, '') : nm} · ${edPctText(a.volume)}`; }
   });
 }
 /* texts and sizes that change while a clip is being trimmed (cheap: no redraw of the filmstrips) */
@@ -1987,7 +2044,7 @@ function edPanelAudio(){
   const row = a => {
     const used = (ed.tl.audio || []).filter(x => x.src === a.src && x.file === a.file).length;
     return `<div class="flex items-center gap-2 px-4 py-2.5">
-      <div class="min-w-0 flex-1"><div class="truncate font-mono text-xs" title="${esc(a.file)}">${esc(a.file)}</div>
+      <div class="min-w-0 flex-1"><div class="truncate text-xs font-medium" title="${esc(a.file)}">${esc(edAudioName(a))}</div>
         <div class="hint">${edT(a.seconds)}${used ? ` · on timeline${used > 1 ? ' ×' + used : ''}` : ''}</div></div>
       ${a.src === 'music' ? `<button type="button" class="btn btn-ghost btn-icon btn-sm" data-pa="delmusic" data-file="${esc(a.file)}" title="Delete this music file" aria-label="Delete ${esc(a.file)}">${lu('trash-2')}</button>` : ''}
       <button type="button" class="btn btn-outline btn-sm" data-pa="addaudio" data-src="${a.src}" data-file="${esc(a.file)}">${lu('plus')}Add</button>
@@ -2013,7 +2070,7 @@ function edPanelAudioItem(){
   return `
     <div class="border-b px-4 py-3">
       <div class="hint">Audio piece ${i + 1} of ${ed.tl.audio.length} · ${a.src === 'music' ? 'music' : 'narration'}</div>
-      <div class="truncate font-mono text-xs" title="${esc(a.file)}">${esc(a.file)}</div>
+      <div class="truncate text-xs font-medium" title="${esc(a.file)}">${esc(edAudioName(a))}</div>
       <div class="hint">${edT(len)}${len < d - 0.05 ? ` (trimmed from ${edT(d)})` : ''} · from ${edT(a.at)} to ${edT(a.at + len)}</div>
     </div>
     <div class="space-y-4 p-4">

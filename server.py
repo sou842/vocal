@@ -694,12 +694,15 @@ def audio_path(project, src, fname):
 
 def audio_infos(project):
     """The audio files available to the editor, with their length."""
-    out = []
+    out, names = [], load_names(project)
     for src, files in (("project", list_audio(project)), ("music", list_music(project))):
         for f in files:
             secs = editor.probe_duration(audio_path(project, src, f) or "")
             if secs:
-                out.append({"src": src, "file": f, "seconds": round(secs, 2)})
+                item = {"src": src, "file": f, "seconds": round(secs, 2)}
+                if src == "project" and f in names:
+                    item["label"] = names[f]
+                out.append(item)
     return out
 
 
@@ -792,6 +795,58 @@ def edit_worker():
         finally:
             job_update(job, plan=None, finished=time.time())
             edit_q.task_done()
+
+
+# ------------------------------------------------------------------ renaming
+# Audio files must stay "<Project>_<N>.wav" (numbering, ordering and saved scripts depend on it), so an audio file gets a
+# display name stored in names.json. A video file can be renamed for real; saved editor timelines are updated to match.
+def names_file(project):
+    return os.path.join(project_dir(project), "names.json")
+
+
+def load_names(project):
+    try:
+        with open(names_file(project), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_names(project, names):
+    path = names_file(project)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(names, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def clean_label(text):
+    return re.sub(r"[\x00-\x1f\x7f]", "", str(text or "")).strip()[:60]
+
+
+def clean_video_stem(text):
+    """A video file name (without .mp4): letters, digits, '_', '-', '.', '(' and ')'; spaces become '_'."""
+    text = re.sub(r"\.mp4$", "", str(text or "").strip(), flags=re.IGNORECASE)
+    text = re.sub(r"[^A-Za-z0-9_.()-]", "", text.replace(" ", "_")).strip("._")
+    return text[:80]
+
+
+def rename_in_editor(project, old, new):
+    """Point a project's saved editor timeline at a renamed video."""
+    path = editor_file(project)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return
+    changed = False
+    for c in raw.get("clips", []) if isinstance(raw, dict) else []:
+        if isinstance(c, dict) and c.get("file") == old:
+            c["file"] = new
+            changed = True
+    if changed:
+        save_editor(project, raw)
 
 
 # ------------------------------------------------------------------ HTTP
@@ -1012,6 +1067,10 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 raise ApiError(404, "This extraction no longer exists (the server may have restarted).")
             return self.send_json(job_snapshot(job))
+        if path == "/api/audio-names":   # display names of audio files {file: name}
+            project = resolve_project(arg("project"))
+            have = set(list_audio(project))
+            return self.send_json({k: v for k, v in load_names(project).items() if k in have})
         if path == "/api/files":
             return self.send_json(list_audio(resolve_project(arg("project"))))
         if path == "/api/docs":
@@ -1250,6 +1309,42 @@ class Handler(BaseHTTPRequestHandler):
             project = resolve_project(body.get("project"))
             save_editor(project, editor.clean_timeline(body.get("timeline")))
             return self.send_json({"ok": True})
+
+        if path == "/api/audio/rename":   # give an audio file a display name (empty = back to the file name)
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            fname = os.path.basename(str(body.get("file") or ""))
+            if number_of(project, fname) is None or not os.path.isfile(os.path.join(project_dir(project), fname)):
+                raise ApiError(404, "Audio file not found.")
+            label = clean_label(body.get("name"))
+            with audio_lock:
+                names = load_names(project)
+                if label:
+                    names[fname] = label
+                else:
+                    names.pop(fname, None)
+                save_names(project, names)
+            return self.send_json({"file": fname, "name": label})
+
+        if path == "/api/video/rename":   # really rename a video file
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            old = os.path.basename(str(body.get("file") or ""))
+            stem = clean_video_stem(body.get("name"))
+            if not stem or stem.lower().endswith(".part"):
+                raise ApiError(400, "Enter a name for the video (letters, numbers, - and _).")
+            new = stem + ".mp4"
+            with audio_lock:
+                videos = list_videos(project)
+                if old not in videos:
+                    raise ApiError(404, "Video not found.")
+                if new != old and new.lower() in {v.lower() for v in videos if v != old}:
+                    raise ApiError(409, f'A video called "{new}" already exists.')
+                vdir = video_dir(project)
+                if new != old:
+                    os.replace(os.path.join(vdir, old), os.path.join(vdir, new))
+                    rename_in_editor(project, old, new)
+            return self.send_json({"file": new})
 
         if path == "/api/editor/music":   # upload a music file into this project
             body = self.read_json()
