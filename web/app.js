@@ -210,11 +210,12 @@ async function refreshCounts(){
 }
 
 /* ================================================================ router */
-const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'videos', 'settings'];
-const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', videos: 'Videos', settings: 'Settings'};
+const VIEWS = ['empty', 'generate', 'documents', 'doc', 'audio', 'videos', 'editor', 'settings'];
+const TITLES = {generate: 'Generate speech', documents: 'Documents', doc: 'Document', audio: 'Audio library', videos: 'Videos', editor: 'Editor', settings: 'Settings'};
 function setCrumb(text){ $('crumbPage').textContent = text; $('crumbPage').title = text; }
 function show(view){
   VIEWS.forEach(v => { $('view-' + v).hidden = v !== view; });
+  document.querySelector('main').style.maxWidth = view === 'editor' ? 'none' : '';   // the editor uses the whole width
   const nav = view === 'doc' ? 'documents' : view;
   document.querySelectorAll('.nav-link').forEach(a => {
     a.classList.toggle('active', a.dataset.route === nav);
@@ -228,11 +229,12 @@ function route(){
   if (!curProject()){ show('empty'); setCrumb('Get started'); return; }
   const h = currentRoute();
   if (h.startsWith('doc/')){ show('doc'); openDoc(h.slice(4)); return; }
-  const v = ['generate', 'documents', 'audio', 'videos', 'settings'].includes(h) ? h : 'generate';
+  const v = ['generate', 'documents', 'audio', 'videos', 'editor', 'settings'].includes(h) ? h : 'generate';
   show(v);
   if (v === 'documents') loadDocs();
   if (v === 'audio') loadAudio();
   if (v === 'videos') loadVideos();
+  if (v === 'editor') loadEditor();
   if (v === 'settings') loadSettings(true);
 }
 document.querySelectorAll('.nav-link').forEach(a => {
@@ -1406,6 +1408,581 @@ async function loadVideos(){
   });
 }
 
+/* ================================================================ editor (timeline)
+   The editing rules live in editor_core.js (pure functions, tested with Node). This section is the screen:
+   timeline drawing, dragging, the player, the side panels and keyboard shortcuts.
+   The timeline (ed.tl) is saved to the server a moment after every change. */
+const EC = EditorCore;
+const ed = {
+  lib: {}, tl: {clips: [], fade_in: false, fade_out: false, fade_len: 1}, sel: -1, t: 0, playing: false,
+  z: 40, tab: 'clips', jobId: null, uid: 0, saveTimer: null, hist: new EC.History(), name: '',
+  cur: 0, pi: 0, prep: null, raf: 0, drag: null, loadTok: [0, 0], fitted: false,
+};
+try { const z = parseFloat(store.get('edZoom')); if (z >= 2 && z <= 200){ ed.z = z; ed.fitted = true; } } catch (e){ /* default zoom */ }
+const edV = [$('edV0'), $('edV1')];                       // two players: the next clip is made ready in the idle one
+const edUrl = f => videoUrl(curProject(), f);
+const edStrip = f => qp('/api/editor/strip', {project: curProject(), file: f}) + '&v=' + (ed.lib[f] || 0);
+const edL = () => EC.layout(ed.tl, ed.lib);
+const edClip = i => ed.tl.clips[i];
+const edT = s => { s = Math.max(0, s || 0); return Math.floor(s / 60) + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
+const natural = (a, b) => a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
+const JOIN_LABELS = {cut: 'Cut', fade: 'Crossfade', dip: 'Dip to black'};
+const JOIN_ICONS = {cut: 'chevrons-left-right', fade: 'blend', dip: 'moon'};
+const CELL_W = 128, CELL_H = 72;                           // one filmstrip frame on the timeline
+const SWITCH = 'relative h-5 w-9 shrink-0 cursor-pointer appearance-none rounded-full bg-border transition-colors checked:bg-primary before:absolute before:left-0.5 before:top-0.5 before:size-4 before:rounded-full before:bg-background before:transition-transform checked:before:translate-x-4';
+
+/* ---------------------------------------------------------------- loading and saving */
+async function loadEditor(){
+  const p = curProject();
+  let r;
+  try { r = await api.get(qp('/api/editor', {project: p})); } catch (e){ toast(e.message); return; }
+  if (p !== curProject() || currentRoute() !== 'editor') return;
+  edPause();
+  ed.lib = {};
+  r.clips.forEach(c => { ed.lib[c.file] = c.seconds; });
+  const saved = r.timeline.clips;
+  ed.tl = {...r.timeline, clips: saved.filter(c => ed.lib[c.file]).map(c => ({...c, uid: ++ed.uid}))};
+  if (ed.tl.clips.length < saved.length) toast(`${saved.length - ed.tl.clips.length} clip(s) were removed because their video files no longer exist.`, 5000);
+  ed.hist.clear(); ed.sel = ed.tl.clips.length ? 0 : -1; ed.t = 0; ed.prep = null; ed.cur = 0; ed.pi = 0;
+  edV.forEach(v => { v.removeAttribute('src'); delete v.dataset.file; v.load(); });
+  ed.tab = ed.tl.clips.length ? 'clip' : 'clips';
+  if (!ed.fitted) edFit(false);
+  $('edZoom').value = ed.z;
+  edRenderAll();
+  edSeek(0);
+}
+async function edRefreshLib(){   // after an export: show the new video in "Your clips" without touching the timeline
+  const p = curProject();
+  try {
+    const r = await api.get(qp('/api/editor', {project: p}));
+    if (p !== curProject() || currentRoute() !== 'editor') return;
+    r.clips.forEach(c => { ed.lib[c.file] = c.seconds; });
+    edRenderPanel();
+  } catch (e){ /* cosmetic */ }
+}
+function edSave(){
+  clearTimeout(ed.saveTimer);
+  const p = curProject();
+  ed.saveTimer = setTimeout(() => api.post('/api/editor/save', {project: p, timeline: ed.tl}).catch(() => {}), 500);
+}
+/* every edit goes through here: remembered for undo, saved, redrawn */
+function edCommit(next, opts = {}){
+  if (JSON.stringify(next) === JSON.stringify(ed.tl)) return;
+  ed.hist.push(ed.tl);
+  ed.tl = next;
+  if (opts.select != null) ed.sel = opts.select;
+  edAfterChange();
+}
+function edAfterChange(){
+  edPause();
+  ed.sel = ed.tl.clips.length ? Math.min(ed.sel, ed.tl.clips.length - 1) : -1;
+  ed.t = EC.clamp(ed.t, 0, edL().total);
+  ed.prep = null;
+  edSave();
+  edRenderAll();
+  edSeek(ed.t);
+}
+function edUndo(){ const r = ed.hist.undo(ed.tl); if (r){ ed.tl = r; edAfterChange(); } }
+function edRedo(){ const r = ed.hist.redo(ed.tl); if (r){ ed.tl = r; edAfterChange(); } }
+
+/* ---------------------------------------------------------------- drawing */
+function edRenderAll(){ edRenderTimeline(); edRenderPanel(); edRenderChrome(); }
+
+function edRenderChrome(){
+  const n = ed.tl.clips.length, L = edL();
+  document.querySelectorAll('[data-tab]').forEach(b => {
+    const on = b.dataset.tab === ed.tab;
+    b.classList.toggle('bg-accent', on); b.classList.toggle('text-foreground', on); b.setAttribute('aria-selected', on);
+  });
+  $('edUndo').disabled = !ed.hist.canUndo; $('edRedo').disabled = !ed.hist.canRedo;
+  $('edExport').disabled = !n || !!ed.jobId;
+  ['edSplit', 'edDup', 'edDel'].forEach(id => { $(id).disabled = !n || (id !== 'edSplit' && ed.sel < 0); });
+  ['edPrev', 'edPlay', 'edNext'].forEach(id => { $(id).disabled = !n; });
+  $('edEmpty').hidden = n > 0;
+  const exp = EC.exportLength(ed.tl, ed.lib);
+  $('edTotal').textContent = n ? `${n} clip${n === 1 ? '' : 's'} · ${edT(L.total)}` + (L.total - exp > 0.05 ? ` · exports as ${edT(exp)}` : '') : '';
+  $('edInfo').textContent = n ? (EC.isFastJoin(ed.tl, ed.lib) ? 'Export is instant (no re-encoding)' : 'Export re-encodes the video') : '';
+  edRenderClock();
+  edPlayIcon();
+}
+function edRenderClock(){
+  const L = edL();
+  $('edClock').textContent = L.total ? edT(ed.t) : '';
+  $('edTime').textContent = L.total ? `${edT(ed.t)} / ${edT(L.total)}` : '';
+}
+function edPlayIcon(){
+  const b = $('edPlay');
+  b.innerHTML = lu(ed.playing ? 'pause' : 'play');
+  b.setAttribute('aria-label', ed.playing ? 'Pause' : 'Play');
+}
+
+const RULER_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+function edRenderTimeline(){
+  const L = edL(), z = ed.z, sc = $('edScroll');
+  const width = Math.max(sc.clientWidth, Math.ceil(L.total * z) + 240);
+  $('edInner').style.width = width + 'px';
+
+  // ruler: a labelled tick at least ~90px apart, lighter ticks between
+  const step = RULER_STEPS.find(s => s * z >= 90) || 3600;
+  const minor = step * z / 5 >= 8 ? step / 5 : 0, unit = minor || step, per = Math.round(step / unit);
+  let ruler = '';
+  for (let k = 0, n = Math.floor(width / z / unit); k <= n; k++){
+    const t = k * unit, major = k % per === 0, x = t * z;
+    ruler += `<div class="absolute bottom-0 border-l ${major ? 'h-3 border-border' : 'h-1.5 border-border/60'}" style="left:${x}px"></div>`;
+    if (major) ruler += `<span class="absolute top-0.5 pl-1 text-[10px] tabular-nums text-muted-foreground" style="left:${x}px">${step < 1 ? t.toFixed(1) : Math.floor(t / 60) + ':' + String(Math.round(t % 60)).padStart(2, '0')}</span>`;
+  }
+  $('edRuler').innerHTML = ruler;
+
+  // clips: a block per clip with a filmstrip, trim handles on both edges and a marker for the join before it
+  const clips = ed.tl.clips;
+  let html = '';
+  clips.forEach((c, i) => {
+    const w = Math.max(L.lens[i] * z - 2, 6), on = i === ed.sel;
+    const cw = Math.max(CELL_W, w / 300), cells = Math.ceil(w / cw);
+    const d = ed.lib[c.file] || 1, s = EC.startOf(ed.lib, c), len = L.lens[i];
+    let strip = '';
+    for (let j = 0; j < cells; j++){
+      const idx = EC.clamp(Math.floor(Math.min(s + (j + 0.5) * cw / z, s + len) / d * 10), 0, 9);   // frame shown in this cell
+      strip += `<div class="shrink-0" style="width:${cw}px;height:${CELL_H}px;background:var(--strip) ${-idx * cw}px 0 / ${10 * cw}px ${CELL_H}px"></div>`;
+    }
+    html += `<div class="group absolute top-1 cursor-pointer overflow-hidden rounded-lg border-2 bg-neutral-800 ${on ? 'border-primary' : 'border-transparent'}"
+        style="left:${L.starts[i] * z}px;width:${w}px;height:${CELL_H + 4}px;--strip:url('${edStrip(c.file)}')" data-block="${i}">
+      <div class="pointer-events-none absolute inset-0 flex">${strip}</div>
+      <div class="pointer-events-none absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/80 to-transparent px-3 pb-1 pt-5 text-[10px] leading-none text-white" data-label="${i}"></div>
+      <div class="absolute inset-y-0 left-0 w-3 cursor-ew-resize bg-primary ${on ? '' : 'opacity-0 group-hover:opacity-80'}" data-handle="start" title="Drag to trim the start"></div>
+      <div class="absolute inset-y-0 right-0 w-3 cursor-ew-resize bg-primary ${on ? '' : 'opacity-0 group-hover:opacity-80'}" data-handle="end" title="Drag to trim the end"></div>
+    </div>`;
+    if (i) html += `<button type="button" class="absolute z-10 grid size-5 -translate-x-1/2 place-items-center rounded-full border bg-background shadow-sm hover:bg-accent [&_svg]:size-3" style="left:${L.starts[i] * z}px;top:2px"
+        data-marker="${i}" title="Join: ${JOIN_LABELS[c.join]}${c.join === 'cut' ? '' : ' ' + c.join_len + 's'}" aria-label="Join: ${JOIN_LABELS[c.join]}">${lu(JOIN_ICONS[c.join])}</button>`;
+  });
+  html += '<div id="edDrop" class="absolute inset-y-0 z-30 w-0.5 bg-primary" hidden></div>';
+  if (!clips.length) html = '<div class="px-4 py-6 text-sm text-muted-foreground">The timeline is empty. Add clips from <b>Your clips</b>.</div>';
+  $('edTrack').innerHTML = html;
+  edLabels();
+  edPlayhead();
+}
+/* texts and sizes that change while a clip is being trimmed (cheap: no redraw of the filmstrips) */
+function edLabels(){
+  const L = edL();
+  document.querySelectorAll('[data-label]').forEach(el => {
+    const i = +el.dataset.label, c = edClip(i);
+    if (c) el.textContent = `${c.file.replace(/\.mp4$/i, '')} · ${edT(L.lens[i])}`;
+  });
+}
+function edLayoutLive(){
+  const L = edL(), z = ed.z;
+  document.querySelectorAll('[data-block]').forEach(el => {
+    const i = +el.dataset.block;
+    el.style.left = L.starts[i] * z + 'px'; el.style.width = Math.max(L.lens[i] * z - 2, 6) + 'px';
+  });
+  document.querySelectorAll('[data-marker]').forEach(el => { el.style.left = L.starts[+el.dataset.marker] * z + 'px'; });
+  $('edInner').style.width = Math.max($('edScroll').clientWidth, Math.ceil(L.total * z) + 240) + 'px';
+  edLabels(); edRenderClock();
+  $('edTotal').textContent = `${ed.tl.clips.length} clips · ${edT(L.total)}`;
+}
+function edPlayhead(){ $('edHead').style.left = ed.t * ed.z + 'px'; }
+function edKeepVisible(){
+  const sc = $('edScroll'), x = ed.t * ed.z;
+  if (x < sc.scrollLeft + 20 || x > sc.scrollLeft + sc.clientWidth - 40) sc.scrollLeft = Math.max(0, x - sc.clientWidth * 0.3);
+}
+
+/* ---------------------------------------------------------------- zoom */
+function edSetZoom(z, anchorX){
+  const sc = $('edScroll'), r = $('edInner').getBoundingClientRect();
+  const anchorT = anchorX != null ? (anchorX - r.left) / ed.z : ed.t;
+  ed.z = EC.clamp(z, 2, 200); ed.fitted = true;
+  store.set('edZoom', String(ed.z));
+  $('edZoom').value = ed.z;
+  edRenderTimeline();
+  const screenX = anchorX != null ? anchorX - sc.getBoundingClientRect().left : sc.clientWidth * 0.3;
+  sc.scrollLeft = Math.max(0, anchorT * ed.z - screenX);
+}
+function edFit(apply = true){
+  const total = edL().total || 10;
+  const z = EC.clamp(($('edScroll').clientWidth - 260) / total, 2, 200);
+  if (apply) edSetZoom(z); else { ed.z = z; }
+}
+$('edZoom').oninput = () => edSetZoom(+$('edZoom').value);
+$('edZoomIn').onclick = () => edSetZoom(ed.z * 1.3);
+$('edZoomOut').onclick = () => edSetZoom(ed.z / 1.3);
+$('edFit').onclick = () => { edFit(true); $('edScroll').scrollLeft = 0; };
+$('edScroll').addEventListener('wheel', ev => {
+  if (!ev.ctrlKey) return;
+  ev.preventDefault();
+  edSetZoom(ed.z * (ev.deltaY < 0 ? 1.15 : 1 / 1.15), ev.clientX);
+}, {passive: false});
+
+/* ---------------------------------------------------------------- the player */
+function edShow(k){ edV.forEach((v, j) => { v.classList.toggle('opacity-0', j !== k); v.classList.toggle('pointer-events-none', j !== k); }); }
+function edLoadInto(k, i, src, done){
+  const el = edV[k], c = edClip(i);
+  if (!c) return;
+  const tok = ++ed.loadTok[k];
+  const go = () => { if (tok !== ed.loadTok[k]) return; try { el.currentTime = src; } catch (e){ /* not ready */ } if (done) done(); };
+  if (el.dataset.file === c.file && el.readyState >= 1) go();
+  else { el.dataset.file = c.file; el.src = edUrl(c.file); el.addEventListener('loadedmetadata', go, {once: true}); }
+}
+function edSeek(t){
+  const L = edL();
+  ed.t = EC.clamp(t, 0, L.total);
+  const loc = EC.locate(ed.tl, ed.lib, ed.t);
+  if (!loc){ edPlayhead(); edRenderClock(); return; }
+  ed.pi = loc.i;
+  if (ed.prep && ed.prep.i !== loc.i + 1) ed.prep = null;
+  edShow(ed.cur);
+  edLoadInto(ed.cur, loc.i, loc.src, () => { if (ed.playing) edV[ed.cur].play().catch(() => {}); });
+  edPlayhead(); edRenderClock();
+}
+function edPlayStart(){
+  const L = edL();
+  if (!L.total) return;
+  if (ed.t >= L.total - 0.05) edSeek(0);
+  ed.playing = true;
+  edV[ed.cur].play().catch(() => {});
+  edPlayIcon();
+  cancelAnimationFrame(ed.raf);
+  ed.raf = requestAnimationFrame(edTick);
+}
+function edPause(){
+  ed.playing = false;
+  edV.forEach(v => v.pause());
+  cancelAnimationFrame(ed.raf);
+  edPlayIcon();
+}
+const edToggle = () => (ed.playing ? edPause() : edPlayStart());
+function edTick(){
+  if (!ed.playing) return;
+  const v = edV[ed.cur], c = edClip(ed.pi);
+  if (!c){ edPause(); return; }
+  const L = edL(), e = EC.endOf(ed.lib, c);
+  if (v.readyState >= 2 && !v.seeking){
+    if (v.currentTime >= e - 0.04 || v.ended) edAdvance();
+    else {
+      ed.t = L.starts[ed.pi] + Math.max(0, v.currentTime - EC.startOf(ed.lib, c));
+      if (e - v.currentTime < 2 && ed.pi < ed.tl.clips.length - 1) edPrepare(ed.pi + 1);
+    }
+  }
+  edPlayhead(); edKeepVisible(); edRenderClock();
+  ed.raf = requestAnimationFrame(edTick);
+}
+/* the next clip is made ready in the idle player, so playback moves on without a pause */
+function edPrepare(i){
+  if (ed.prep && ed.prep.i === i) return;
+  ed.prep = {i, ready: false};
+  edLoadInto(ed.cur ^ 1, i, EC.startOf(ed.lib, edClip(i)), () => { if (ed.prep && ed.prep.i === i) ed.prep.ready = true; });
+}
+function edAdvance(){
+  const ni = ed.pi + 1;
+  if (ni >= ed.tl.clips.length){ edPause(); ed.t = edL().total; edPlayhead(); edRenderClock(); return; }
+  const old = edV[ed.cur];
+  if (ed.prep && ed.prep.i === ni && ed.prep.ready){
+    ed.cur ^= 1; ed.pi = ni; ed.prep = null;
+    edShow(ed.cur);
+    edV[ed.cur].play().catch(() => {});
+    old.pause();
+  } else {
+    ed.pi = ni; ed.prep = null;
+    edLoadInto(ed.cur, ni, EC.startOf(ed.lib, edClip(ni)), () => { if (ed.playing) edV[ed.cur].play().catch(() => {}); });
+  }
+}
+$('edPlay').onclick = edToggle;
+$('edPrev').onclick = () => {
+  const L = edL(), loc = EC.locate(ed.tl, ed.lib, ed.t);
+  if (loc) edSeek(L.starts[loc.i] + 0.5 < ed.t || !loc.i ? L.starts[loc.i] : L.starts[loc.i - 1]);
+};
+$('edNext').onclick = () => {
+  const L = edL(), loc = EC.locate(ed.tl, ed.lib, ed.t);
+  if (loc) edSeek(loc.i < ed.tl.clips.length - 1 ? L.starts[loc.i + 1] : L.total);
+};
+
+/* ---------------------------------------------------------------- pointer: scrub, select, reorder, trim */
+const edXToT = ev => Math.max(0, (ev.clientX - $('edInner').getBoundingClientRect().left) / ed.z);
+function edSelect(i){
+  ed.sel = i;
+  document.querySelectorAll('[data-block]').forEach(el => {
+    const on = +el.dataset.block === i;
+    el.classList.toggle('border-primary', on); el.classList.toggle('border-transparent', !on);
+    el.querySelectorAll('[data-handle]').forEach(h => { h.classList.toggle('opacity-0', !on); h.classList.toggle('group-hover:opacity-80', !on); });
+  });
+  edRenderPanel(); edRenderChrome();
+}
+$('edInner').addEventListener('pointerdown', ev => {
+  if (ev.button !== 0) return;
+  const inner = $('edInner'), marker = ev.target.closest('[data-marker]');
+  if (marker){ ed.tab = 'clip'; edSelect(+marker.dataset.marker); return; }
+  const block = ev.target.closest('[data-block]'), handle = ev.target.closest('[data-handle]');
+  if (block && handle){
+    const i = +block.dataset.block;
+    if (i !== ed.sel) edSelect(i);
+    ed.drag = {kind: 'trim', i, side: handle.dataset.handle, x0: ev.clientX, base: EC.copy(ed.tl)};
+  } else if (block){
+    const i = +block.dataset.block;
+    ed.tab = ed.tab === 'clips' ? 'clip' : ed.tab;
+    if (i !== ed.sel) edSelect(i); else edRenderPanel();
+    edSeek(edXToT(ev));
+    ed.drag = {kind: 'block', i, x0: ev.clientX, moved: false, to: i, el: block};
+  } else {
+    ed.drag = {kind: 'scrub'};
+    edSeek(edXToT(ev));
+  }
+  inner.setPointerCapture(ev.pointerId);
+  ev.preventDefault();
+});
+$('edInner').addEventListener('pointermove', ev => {
+  const d = ed.drag;
+  if (!d) return;
+  if (d.kind === 'scrub'){ edSeek(edXToT(ev)); return; }
+  if (d.kind === 'trim'){
+    const c0 = d.base.clips[d.i], dt = (ev.clientX - d.x0) / ed.z;
+    const patch = d.side === 'start' ? {start: EC.startOf(ed.lib, c0) + dt} : {end: EC.endOf(ed.lib, c0) + dt};
+    ed.tl = EC.setTrim(d.base, ed.lib, d.i, patch);
+    edLayoutLive();
+    const c = edClip(d.i);   // show the frame at the edge being moved
+    ed.pi = d.i; edShow(ed.cur);
+    edLoadInto(ed.cur, d.i, d.side === 'start' ? EC.startOf(ed.lib, c) : Math.max(EC.endOf(ed.lib, c) - 0.05, 0));
+    return;
+  }
+  if (d.kind === 'block'){
+    const dx = ev.clientX - d.x0;
+    if (!d.moved && Math.abs(dx) < 6) return;
+    d.moved = true;
+    d.el.style.transform = `translateX(${dx}px)`; d.el.style.opacity = '0.7'; d.el.style.zIndex = '30';
+    d.to = EC.dropIndex(ed.tl, ed.lib, d.i, edXToT(ev));
+    const L = edL(), others = ed.tl.clips.map((_, k) => k).filter(k => k !== d.i);
+    const x = d.to < others.length ? L.starts[others[d.to]] : L.total;
+    const drop = $('edDrop');
+    drop.hidden = false; drop.style.left = x * ed.z - 1 + 'px';
+  }
+});
+function edPointerEnd(ev){
+  const d = ed.drag;
+  if (!d) return;
+  ed.drag = null;
+  try { $('edInner').releasePointerCapture(ev.pointerId); } catch (e){ /* already released */ }
+  if (d.kind === 'trim'){
+    if (JSON.stringify(ed.tl) !== JSON.stringify(d.base)){ ed.hist.push(d.base); edAfterChange(); }
+    else edRenderTimeline();
+  } else if (d.kind === 'block'){
+    if (d.moved && d.to !== d.i){ edCommit(EC.moveClip(ed.tl, d.i, d.to), {select: d.to}); }
+    else if (d.moved) edRenderTimeline();
+  }
+}
+$('edInner').addEventListener('pointerup', edPointerEnd);
+$('edInner').addEventListener('pointercancel', edPointerEnd);
+
+/* ---------------------------------------------------------------- toolbar actions */
+function edSplitHere(){
+  const r = EC.splitAt(ed.tl, ed.lib, ed.t, () => ++ed.uid);
+  if (!r){ toast('Put the playhead inside a clip, not right at its edge, to split it.'); return; }
+  edCommit(r.tl, {select: r.index});
+}
+function edDelete(){
+  if (ed.sel < 0) return;
+  edCommit(EC.removeClip(ed.tl, ed.sel), {select: ed.sel});
+}
+function edDuplicate(){
+  if (ed.sel < 0) return;
+  edCommit(EC.duplicateClip(ed.tl, ed.sel, () => ++ed.uid), {select: ed.sel + 1});
+}
+function edAdd(files){
+  const next = EC.copy(ed.tl);
+  files.forEach(f => next.clips.push({file: f, start: 0, end: 0, join: 'cut', join_len: 0.8, uid: ++ed.uid}));
+  edCommit(next, {select: ed.sel < 0 ? 0 : ed.sel});
+}
+$('edSplit').onclick = edSplitHere;
+$('edDel').onclick = edDelete;
+$('edDup').onclick = edDuplicate;
+$('edUndo').onclick = edUndo;
+$('edRedo').onclick = edRedo;
+document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { ed.tab = b.dataset.tab; edRenderPanel(); edRenderChrome(); });
+
+/* keyboard shortcuts (only on this page, and not while typing) */
+document.addEventListener('keydown', ev => {
+  if (currentRoute() !== 'editor' || $('videoDialog').open || ev.altKey) return;
+  const tag = (ev.target.tagName || '').toLowerCase();
+  if (['input', 'select', 'textarea'].includes(tag) || ev.target.isContentEditable) return;
+  const k = ev.key.toLowerCase(), mod = ev.ctrlKey || ev.metaKey;
+  if (k === ' '){ ev.preventDefault(); edToggle(); }
+  else if (mod && k === 'z'){ ev.preventDefault(); if (ev.shiftKey) edRedo(); else edUndo(); }
+  else if (mod && k === 'y'){ ev.preventDefault(); edRedo(); }
+  else if (mod) return;
+  else if (k === 's'){ edSplitHere(); }
+  else if (k === 'delete' || k === 'backspace'){ ev.preventDefault(); edDelete(); }
+  else if (k === 'arrowleft' || k === 'arrowright'){
+    ev.preventDefault();
+    edSeek(ed.t + (k === 'arrowleft' ? -1 : 1) * (ev.shiftKey ? 1 : 0.1));
+    edKeepVisible();
+  }
+  else if (k === 'home'){ edSeek(0); $('edScroll').scrollLeft = 0; }
+  else if (k === 'end'){ edSeek(edL().total); edKeepVisible(); }
+});
+document.addEventListener('keyup', ev => {   // a focused button must not also "click" on Space
+  if (ev.key === ' ' && currentRoute() === 'editor' && ev.target.tagName === 'BUTTON') ev.preventDefault();
+});
+window.addEventListener('hashchange', () => { if (currentRoute() !== 'editor') edPause(); });
+
+/* ---------------------------------------------------------------- side panel */
+function edRenderPanel(){
+  const box = $('edPanel');
+  box.innerHTML = ed.tab === 'clips' ? edPanelClips() : ed.tab === 'clip' ? edPanelClip() : edPanelFinish();
+}
+function edPanelClips(){
+  const files = Object.keys(ed.lib).sort(natural);
+  const used = f => ed.tl.clips.filter(c => c.file === f).length;
+  return `
+    <div class="flex items-center justify-between gap-2 border-b px-4 py-3">
+      <div class="font-semibold">Your clips</div>
+      <button type="button" class="btn btn-outline btn-sm" data-pa="addall" ${files.length ? '' : 'disabled'}>${lu('list-plus')}Add all</button>
+    </div>
+    <div class="divide-y">${files.length ? files.map(f => `
+      <div class="flex items-center gap-2 px-4 py-2.5">
+        <div class="min-w-0 flex-1"><div class="truncate font-mono text-xs" title="${esc(f)}">${esc(f)}</div>
+          <div class="hint">${edT(ed.lib[f])}${used(f) ? ` · on timeline${used(f) > 1 ? ' ×' + used(f) : ''}` : ''}</div></div>
+        <button type="button" class="btn btn-outline btn-sm" data-pa="add" data-file="${esc(f)}">${lu('plus')}Add</button>
+      </div>`).join('') : `<div class="px-4 py-8 text-center text-sm text-muted-foreground">No videos yet. Make some in <b>Videos</b> first.</div>`}
+    </div>`;
+}
+function edPanelClip(){
+  const i = ed.sel, c = edClip(i), n = ed.tl.clips.length;
+  if (!c) return `<div class="px-5 py-10 text-center text-sm text-muted-foreground">Click a clip on the timeline to adjust it.</div>`;
+  const d = ed.lib[c.file] || 0, s = EC.startOf(ed.lib, c), e = EC.endOf(ed.lib, c), field = 'input h-8 w-full py-0 text-xs';
+  return `
+    <div class="border-b px-4 py-3">
+      <div class="hint">Clip ${i + 1} of ${n}</div>
+      <div class="truncate font-mono text-xs" title="${esc(c.file)}">${esc(c.file)}</div>
+      <div class="hint">${edT(e - s)}${EC.isTrimmed(ed.lib, c) ? ` (trimmed from ${edT(d)})` : ''}</div>
+    </div>
+    <div class="space-y-4 p-4">
+      <div>
+        <div class="label mb-2">Trim <span class="hint font-normal">(seconds in the clip)</span></div>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="text-xs">Start<input type="number" class="${field}" min="0" max="${d}" step="0.1" value="${+s.toFixed(2)}" data-in="start"></label>
+          <label class="text-xs">End<input type="number" class="${field}" min="0" max="${d}" step="0.1" value="${+e.toFixed(2)}" data-in="end"></label>
+          <button type="button" class="btn btn-outline btn-sm" data-pa="starthere" title="Start the clip at the playhead">${lu('scissors')}Start here</button>
+          <button type="button" class="btn btn-outline btn-sm" data-pa="endhere" title="End the clip at the playhead">${lu('scissors')}End here</button>
+        </div>
+        <button type="button" class="btn btn-ghost btn-sm mt-2" data-pa="reset" ${EC.isTrimmed(ed.lib, c) ? '' : 'hidden'}>${lu('rotate-ccw')}Reset trim</button>
+        <p class="hint mt-1">You can also drag the edges of the clip on the timeline.</p>
+      </div>
+      ${i ? `<div>
+        <div class="label mb-2">Join with the clip before</div>
+        <select class="input h-8 py-0 text-xs" data-in="join">${Object.entries(JOIN_LABELS).map(([k, l]) => `<option value="${k}" ${c.join === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <label class="mt-2 flex items-center justify-between gap-3 text-xs" ${c.join === 'cut' ? 'hidden' : ''}>Length (seconds)
+          <input type="number" class="input h-8 w-24 py-0 text-xs" min="0.1" max="5" step="0.1" value="${c.join_len}" data-in="joinlen"></label>
+        <p class="hint mt-1">${c.join === 'cut' ? 'A cut is instant.' : 'The two clips overlap during the transition. It shows in the exported video, not in the preview.'}</p>
+      </div>` : ''}
+      <div class="grid grid-cols-2 gap-2">
+        <button type="button" class="btn btn-outline btn-sm" data-pa="up" ${i ? '' : 'disabled'}>${lu('arrow-left')}Move earlier</button>
+        <button type="button" class="btn btn-outline btn-sm" data-pa="down" ${i < n - 1 ? '' : 'disabled'}>Move later${lu('arrow-right')}</button>
+        <button type="button" class="btn btn-outline btn-sm" data-pa="split">${lu('scissors')}Split here</button>
+        <button type="button" class="btn btn-outline btn-sm" data-pa="dup">${lu('copy')}Duplicate</button>
+      </div>
+      <button type="button" class="btn btn-outline btn-sm w-full text-destructive" data-pa="del">${lu('trash-2')}Remove from timeline</button>
+    </div>`;
+}
+function edPanelFinish(){
+  const L = edL(), exp = EC.exportLength(ed.tl, ed.lib), n = ed.tl.clips.length;
+  return `
+    <div class="border-b px-4 py-3"><div class="font-semibold">Finish and export</div></div>
+    <div class="space-y-4 p-4">
+      <label class="flex cursor-pointer items-center justify-between gap-3"><span class="label">Fade in from black</span>
+        <input type="checkbox" role="switch" class="${SWITCH}" data-in="fadein" ${ed.tl.fade_in ? 'checked' : ''}></label>
+      <label class="flex cursor-pointer items-center justify-between gap-3"><span class="label">Fade out to black</span>
+        <input type="checkbox" role="switch" class="${SWITCH}" data-in="fadeout" ${ed.tl.fade_out ? 'checked' : ''}></label>
+      <label class="flex items-center justify-between gap-3 text-sm"><span class="label">Fade length (seconds)</span>
+        <input type="number" class="input h-8 w-24 py-0 text-xs" min="0.2" max="5" step="0.1" value="${ed.tl.fade_len}" data-in="fadelen"></label>
+      <div>
+        <label class="label mb-2 block" for="edName">Name of the new video</label>
+        <input id="edName" class="input" maxlength="40" placeholder="Final_video" autocomplete="off" value="${esc(ed.name)}" data-in="name">
+        <p class="hint mt-1.5">Saved in this project's Videos. Your original clips are never changed.</p>
+      </div>
+      <div class="rounded-lg bg-muted p-3 text-xs">
+        <div class="flex justify-between"><span>Clips</span><b>${n}</b></div>
+        <div class="flex justify-between"><span>Length</span><b>${edT(exp)}</b></div>
+        <div class="mt-1.5 text-muted-foreground">${!n ? '' : EC.isFastJoin(ed.tl, ed.lib) ? 'Only cuts and no trims: the clips are joined without re-encoding (instant, no quality loss).' : 'Trims, fades or transitions need the video to be re-encoded. Long videos take a few minutes.'}</div>
+      </div>
+      <button type="button" class="btn btn-primary w-full" data-pa="export" ${n && !ed.jobId ? '' : 'disabled'}>${lu('clapperboard')}Export video</button>
+    </div>`;
+}
+
+$('edPanel').addEventListener('click', ev => {
+  const b = ev.target.closest('[data-pa]');
+  if (!b || b.disabled) return;
+  const act = b.dataset.pa, i = ed.sel, c = edClip(i);
+  if (act === 'add') edAdd([b.dataset.file]);
+  else if (act === 'addall'){
+    const have = new Set(ed.tl.clips.map(x => x.file));
+    const files = Object.keys(ed.lib).sort(natural).filter(f => !have.has(f));
+    if (!files.length) toast('All clips are already on the timeline.'); else edAdd(files);
+  }
+  else if (act === 'up' && i > 0) edCommit(EC.moveClip(ed.tl, i, i - 1), {select: i - 1});
+  else if (act === 'down' && i < ed.tl.clips.length - 1) edCommit(EC.moveClip(ed.tl, i, i + 1), {select: i + 1});
+  else if (act === 'dup') edDuplicate();
+  else if (act === 'del') edDelete();
+  else if (act === 'split') edSplitHere();
+  else if (act === 'reset' && c) edCommit(EC.resetTrim(ed.tl, ed.lib, i));
+  else if ((act === 'starthere' || act === 'endhere') && c){
+    const loc = EC.locate(ed.tl, ed.lib, ed.t);
+    if (!loc || loc.i !== i){ toast('Move the playhead onto the selected clip first.'); return; }
+    edCommit(EC.setTrim(ed.tl, ed.lib, i, act === 'starthere' ? {start: loc.src} : {end: loc.src}));
+  }
+  else if (act === 'export') edExport();
+});
+$('edPanel').addEventListener('change', ev => {
+  const t = ev.target, key = t.dataset.in, i = ed.sel, c = edClip(i);
+  if (!key || key === 'name') return;
+  if (key === 'start' && c) edCommit(EC.setTrim(ed.tl, ed.lib, i, {start: parseFloat(t.value) || 0}));
+  else if (key === 'end' && c) edCommit(EC.setTrim(ed.tl, ed.lib, i, {end: parseFloat(t.value) || 0}));
+  else if (key === 'join' && c){ const n = EC.copy(ed.tl); n.clips[i].join = t.value; edCommit(n); }
+  else if (key === 'joinlen' && c){ const n = EC.copy(ed.tl); n.clips[i].join_len = EC.clamp(parseFloat(t.value) || 0.8, 0.1, 5); edCommit(n); }
+  else if (key === 'fadein'){ const n = EC.copy(ed.tl); n.fade_in = t.checked; edCommit(n); }
+  else if (key === 'fadeout'){ const n = EC.copy(ed.tl); n.fade_out = t.checked; edCommit(n); }
+  else if (key === 'fadelen'){ const n = EC.copy(ed.tl); n.fade_len = EC.clamp(parseFloat(t.value) || 1, 0.2, 5); edCommit(n); }
+  edRenderPanel();   // show the clamped value
+});
+$('edPanel').addEventListener('input', ev => { if (ev.target.dataset.in === 'name') ed.name = ev.target.value; });
+
+/* ---------------------------------------------------------------- export */
+async function edExport(){
+  if (!ed.tl.clips.length || ed.jobId) return;
+  $('edExport').disabled = true;
+  try {
+    clearTimeout(ed.saveTimer);
+    const j = await api.post('/api/editor/export', {project: curProject(), timeline: ed.tl, name: ed.name});
+    pollEdit(j.id, curProject());
+  } catch (e){ toast(e.message, 6000); edRenderChrome(); }
+}
+$('edExport').onclick = edExport;
+
+async function pollEdit(id, project){
+  ed.jobId = id;
+  const bar = $('edActive');
+  bar.hidden = false; $('edProg').style.width = '0%'; $('edPct').textContent = ''; $('edStatus').textContent = 'Queued...';
+  edRenderChrome(); if (ed.tab === 'finish') edRenderPanel();
+  const finish = () => { bar.hidden = true; ed.jobId = null; edRenderChrome(); if (ed.tab === 'finish') edRenderPanel(); };
+  let failures = 0;
+  while (ed.jobId === id){
+    let j;
+    try { j = await api.get('/api/editor/jobs/' + encodeURIComponent(id)); failures = 0; }
+    catch (e){
+      if (e.network && ++failures < 8){ await sleep(2000); continue; }
+      finish(); toast('Editor: ' + e.message); return;
+    }
+    if (j.status === 'done'){
+      finish();
+      toast('Video ready: ' + j.file + ' (see Videos)', 6000);
+      if (currentRoute() === 'editor' && curProject() === project) edRefreshLib();
+      return;
+    }
+    if (j.status === 'error'){ finish(); toast(j.error || 'Joining the clips failed.', 8000); return; }
+    const pct = j.total ? Math.round(j.done / j.total * 100) : 0;
+    $('edStatus').textContent = (j.status === 'queued' ? 'Queued...' : j.fast ? 'Joining the clips...' : 'Rendering the joined video...')
+      + (j.elapsed != null && j.status !== 'queued' ? ` (${fmt(j.elapsed)})` : '');
+    $('edProg').style.width = pct + '%'; $('edPct').textContent = j.total && j.status === 'joining' ? pct + '%' : '';
+    await sleep(1200);
+  }
+}
+
 /* ================================================================ re-attach to running jobs after a reload */
 async function resumeActiveJobs(){
   let a;
@@ -1418,6 +1995,8 @@ async function resumeActiveJobs(){
   }
   const v = a.video && a.video[0];
   if (v && !vidPollId) pollVideo(v.id, v.project);
+  const e = a.edit && a.edit[0];
+  if (e && !ed.jobId) pollEdit(e.id, e.project);
   const x = a.extract && a.extract[0];
   if (x && !extracting){
     extracting = true;

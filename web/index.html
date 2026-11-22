@@ -73,6 +73,9 @@
       <a class="nav-link" data-route="videos" title="Videos">
         <i data-lucide="clapperboard"></i><span class="sb-hide truncate">Videos</span>
       </a>
+      <a class="nav-link" data-route="editor" title="Editor">
+        <i data-lucide="scissors"></i><span class="sb-hide truncate">Editor</span>
+      </a>
       <div class="sb-hide mb-1.5 mt-4 px-1 text-xs font-medium text-muted-foreground">System</div>
       <a class="nav-link" data-route="settings" title="Settings">
         <i data-lucide="settings"></i><span class="sb-hide truncate">Settings</span>
@@ -418,6 +421,81 @@
         <div class="card"><div id="videoList" class="divide-y"></div></div>
       </section>
 
+      <!-- ============ Editor ============ -->
+      <section id="view-editor" hidden>
+        <div class="flex flex-col gap-3" style="min-height: calc(100vh - 6.5rem)">
+          <!-- top bar -->
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="min-w-0">
+              <h1 class="text-2xl font-semibold tracking-tight">Editor</h1>
+              <p id="edSub" class="hint">Put your video pieces in order, trim them and export one video.</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" id="edUndo" class="btn btn-outline btn-icon" title="Undo (Ctrl+Z)" aria-label="Undo"><i data-lucide="undo-2"></i></button>
+              <button type="button" id="edRedo" class="btn btn-outline btn-icon" title="Redo (Ctrl+Y)" aria-label="Redo"><i data-lucide="redo-2"></i></button>
+              <button type="button" id="edExport" class="btn btn-primary"><i data-lucide="clapperboard"></i>Export video</button>
+            </div>
+          </div>
+          <div id="edActive" class="card p-4" hidden>
+            <div class="mb-2 flex items-center justify-between gap-3">
+              <div class="flex min-w-0 items-center gap-2"><span class="spinner"></span><span id="edStatus" class="truncate font-medium">Working...</span></div>
+              <span id="edPct" class="hint tabular-nums"></span>
+            </div>
+            <div class="progress"><div id="edProg" style="width:0%"></div></div>
+          </div>
+
+          <!-- stage: tools | preview | panel -->
+          <div class="grid gap-3 lg:grid-cols-[3.5rem_minmax(0,1fr)_21rem]" style="height: clamp(18rem, 46vh, 32rem)">
+            <div class="card flex items-center gap-1.5 p-1.5 lg:flex-col lg:justify-start" role="tablist" aria-label="Editor tools">
+              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clips" title="Your clips" aria-label="Your clips"><i data-lucide="film"></i></button>
+              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clip" title="Selected clip" aria-label="Selected clip"><i data-lucide="sliders-horizontal"></i></button>
+              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="finish" title="Finish and export" aria-label="Finish and export"><i data-lucide="sparkles"></i></button>
+            </div>
+            <div class="relative min-h-0 overflow-hidden rounded-xl border bg-black">
+              <video id="edV0" class="absolute inset-0 size-full object-contain" preload="auto" playsinline></video>
+              <video id="edV1" class="pointer-events-none absolute inset-0 size-full object-contain opacity-0" preload="auto" playsinline></video>
+              <div id="edEmpty" class="absolute inset-0 grid place-items-center px-6 text-center text-sm text-white/70" hidden>Add clips from <b class="mx-1">Your clips</b> to start editing.</div>
+              <div id="edClock" class="pointer-events-none absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-1 font-mono text-xs text-white tabular-nums"></div>
+            </div>
+            <div id="edPanel" class="card min-h-0 overflow-y-auto"></div>
+          </div>
+
+          <!-- timeline -->
+          <div class="card flex min-h-0 flex-1 flex-col">
+            <div class="flex flex-wrap items-center gap-1.5 border-b px-3 py-2">
+              <button type="button" id="edSplit" class="btn btn-outline btn-sm" title="Split the clip at the playhead (S)"><i data-lucide="scissors"></i>Split</button>
+              <button type="button" id="edDup" class="btn btn-outline btn-sm" title="Duplicate the selected clip"><i data-lucide="copy"></i>Duplicate</button>
+              <button type="button" id="edDel" class="btn btn-outline btn-sm" title="Delete the selected clip (Delete)"><i data-lucide="trash-2"></i>Delete</button>
+              <span id="edTotal" class="hint ml-2"></span>
+              <div class="ml-auto flex items-center gap-2">
+                <button type="button" id="edZoomOut" class="btn btn-ghost btn-icon btn-sm" title="Zoom out" aria-label="Zoom out"><i data-lucide="zoom-out"></i></button>
+                <input id="edZoom" type="range" min="2" max="200" step="1" class="w-28" aria-label="Zoom">
+                <button type="button" id="edZoomIn" class="btn btn-ghost btn-icon btn-sm" title="Zoom in" aria-label="Zoom in"><i data-lucide="zoom-in"></i></button>
+                <button type="button" id="edFit" class="btn btn-outline btn-sm" title="Fit the whole timeline">Fit</button>
+              </div>
+            </div>
+            <div id="edScroll" class="relative min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
+              <div id="edInner" class="relative select-none" style="min-height: 7.5rem; touch-action: pan-x">
+                <div id="edRuler" class="relative h-7 cursor-pointer border-b"></div>
+                <div id="edTrack" class="relative h-20"></div>
+                <div id="edHead" class="pointer-events-none absolute top-0 bottom-0 z-20 w-0 border-l-2 border-primary" style="left:0">
+                  <span class="absolute -left-[7px] -top-px size-3 rotate-45 rounded-[2px] bg-primary"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- transport -->
+          <div class="card flex flex-wrap items-center justify-center gap-3 p-2">
+            <button type="button" id="edPrev" class="btn btn-ghost btn-icon" title="Previous clip" aria-label="Previous clip"><i data-lucide="skip-back"></i></button>
+            <button type="button" id="edPlay" class="btn btn-primary btn-icon size-10 rounded-full" title="Play / pause (Space)" aria-label="Play"><i data-lucide="play"></i></button>
+            <button type="button" id="edNext" class="btn btn-ghost btn-icon" title="Next clip" aria-label="Next clip"><i data-lucide="skip-forward"></i></button>
+            <span id="edTime" class="min-w-40 text-center font-mono text-sm tabular-nums"></span>
+            <span id="edInfo" class="hint"></span>
+          </div>
+        </div>
+      </section>
+
       <!-- ============ Settings ============ -->
       <section id="view-settings" hidden>
         <div class="mb-6">
@@ -546,6 +624,7 @@
 <div id="toast" class="pointer-events-none fixed bottom-6 left-1/2 z-50 max-w-[calc(100vw-2rem)] -translate-x-1/2 translate-y-4 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground opacity-0 shadow-lg transition-all"></div>
 
 <script src="/lucide.min.js"></script>
+<script src="/editor_core.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

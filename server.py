@@ -39,6 +39,7 @@ import numpy as np
 import torch
 import torchaudio as ta
 
+import editor
 import video
 import voicecheck
 import voicelib
@@ -71,6 +72,7 @@ os.makedirs(VOICES, exist_ok=True)
 STATIC = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/editor_core.js": ("editor_core.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/lucide.min.js": ("lucide.min.js", "text/javascript; charset=utf-8"),
 }
@@ -158,11 +160,11 @@ def next_video_name(project, audio_name, style_id):
 
 # ------------------------------------------------------------------ jobs (shared between threads)
 state_lock = threading.RLock()    # guards every job table and every job dict inside them
-tts_jobs, ext_jobs, vid_jobs = {}, {}, {}
-tts_q, ext_q, vid_q = queue.Queue(), queue.Queue(), queue.Queue()
-PRIVATE_KEYS = {"text", "voice", "data", "t0", "remote", "audio", "image"}
+tts_jobs, ext_jobs, vid_jobs, edit_jobs = {}, {}, {}, {}
+tts_q, ext_q, vid_q, edit_q = queue.Queue(), queue.Queue(), queue.Queue(), queue.Queue()
+PRIVATE_KEYS = {"text", "voice", "data", "t0", "remote", "audio", "image", "plan"}
 ACTIVE = {"queued", "loading model", "connecting", "generating", "extracting",
-          "loading alignment model", "aligning", "rendering"}
+          "loading alignment model", "aligning", "rendering", "joining"}
 
 
 def job_update(job, **fields):
@@ -173,7 +175,7 @@ def job_update(job, **fields):
 def job_snapshot(job):
     with state_lock:
         snap = {k: v for k, v in job.items() if k not in PRIVATE_KEYS}
-        if snap.get("status") in ("generating", "loading alignment model", "aligning", "rendering") and "t0" in job:
+        if snap.get("status") in ("generating", "loading alignment model", "aligning", "rendering", "joining") and "t0" in job:
             snap["elapsed"] = round(time.time() - job["t0"])   # live clock between parts
         return snap
 
@@ -182,7 +184,7 @@ def prune_jobs():
     """Forget finished jobs after JOB_TTL_SECONDS so memory doesn't grow forever."""
     cutoff = time.time() - JOB_TTL_SECONDS
     with state_lock:
-        for table in (tts_jobs, ext_jobs, vid_jobs):
+        for table in (tts_jobs, ext_jobs, vid_jobs, edit_jobs):
             for jid in [k for k, j in table.items() if j["status"] not in ACTIVE and j.get("finished", 0) < cutoff]:
                 del table[jid]
 
@@ -628,6 +630,101 @@ def video_worker():
             vid_q.task_done()
 
 
+# ------------------------------------------------------------------ editor (join clips into one video)
+def editor_file(project):
+    return os.path.join(project_dir(project), "editor.json")
+
+
+def load_editor(project):
+    """The timeline saved for this project (an empty one when nothing was saved yet)."""
+    try:
+        with open(editor_file(project), encoding="utf-8") as fh:
+            return editor.clean_timeline(json.load(fh))
+    except (OSError, ValueError):
+        return editor.clean_timeline({})
+
+
+def save_editor(project, timeline):
+    path = editor_file(project)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(timeline, fh)
+    os.replace(tmp, path)
+
+
+def clip_infos(project):
+    """The project's videos with their length, for the editor's clip list."""
+    d = video_dir(project)
+    out = []
+    for f in list_videos(project):
+        secs = editor.probe_duration(os.path.join(d, f))
+        if secs:
+            out.append({"file": f, "seconds": round(secs, 2)})
+    return out
+
+
+strip_lock = threading.Lock()   # thumbnails are made one at a time (each uses FFmpeg)
+
+
+def strip_for(project, fname):
+    """Path of the cached filmstrip JPEG of one of the project's videos (made on first use)."""
+    src = os.path.join(video_dir(project), fname)
+    st = os.stat(src)
+    key = hashlib.sha1(f"{fname}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
+    folder = os.path.join(project_dir(project), ".cache", "strips")
+    out = os.path.join(folder, key + ".jpg")
+    with strip_lock:
+        if not os.path.isfile(out):
+            os.makedirs(folder, exist_ok=True)
+            editor.make_strip(src, out)
+    return out
+
+
+def next_edit_name(project, wanted):
+    stem = clean_name(wanted) or f"{project}_edit"
+    existing = {f.lower() for f in list_videos(project)}
+    name, n = stem + ".mp4", 1
+    while name.lower() in existing:
+        n += 1
+        name = f"{stem}_{n}.mp4"
+    return name
+
+
+def edit_worker():
+    while True:
+        jid = edit_q.get()
+        with state_lock:
+            job = edit_jobs.get(jid)
+        if job is None:
+            edit_q.task_done()
+            continue
+        out = None
+        try:
+            vdir = video_dir(job["project"])
+            with audio_lock:   # reserve the name so nothing else picks it
+                name = next_edit_name(job["project"], job["wanted"])
+                out = os.path.join(vdir, name)
+                open(out, "ab").close()
+            t0 = time.time()
+            job_update(job, status="joining", t0=t0)
+
+            def on_progress(done, total):
+                job_update(job, done=round(done, 1), total=round(total, 1))
+
+            editor.export(job["plan"], lambda f: os.path.join(vdir, f), out, on_progress)
+            job_update(job, status="done", file=name, seconds=round(job["plan"]["total"], 1), took=round(time.time() - t0))
+        except Exception as e:
+            if out:
+                try:
+                    os.remove(out)   # drop the reserved placeholder
+                except OSError:
+                    pass
+            job_update(job, status="error", error=f"Joining the clips failed: {e}")
+        finally:
+            job_update(job, plan=None, finished=time.time())
+            edit_q.task_done()
+
+
 # ------------------------------------------------------------------ HTTP
 def parse_video_options(style, opts_in):
     """Keep only the options the style declares and check each value (theme/font from the list, colour as #rrggbb)."""
@@ -667,7 +764,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if "Cache-Control" not in (extra or {}):
+            self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
@@ -770,7 +868,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({
                     "tts": [dict(job_snapshot(j), id=k) for k, j in tts_jobs.items() if j["status"] in ACTIVE],
                     "extract": [dict(job_snapshot(j), id=k) for k, j in ext_jobs.items() if j["status"] in ACTIVE],
-                    "video": [dict(job_snapshot(j), id=k) for k, j in vid_jobs.items() if j["status"] in ACTIVE]})
+                    "video": [dict(job_snapshot(j), id=k) for k, j in vid_jobs.items() if j["status"] in ACTIVE],
+                    "edit": [dict(job_snapshot(j), id=k) for k, j in edit_jobs.items() if j["status"] in ACTIVE]})
         if path == "/api/voices":
             return self.send_json(voicelib.list_voices())
         m = re.fullmatch(r"/api/voices/([a-f0-9]{12})\.wav", path)
@@ -793,6 +892,25 @@ class Handler(BaseHTTPRequestHandler):
                 job = vid_jobs.get(path.rsplit("/", 1)[1])
             if not job:
                 raise ApiError(404, "This video job no longer exists (the server may have restarted).")
+            return self.send_json(job_snapshot(job))
+        if path == "/api/editor":   # clips available in this project + the saved timeline
+            project = resolve_project(arg("project"))
+            return self.send_json({"clips": clip_infos(project), "timeline": load_editor(project)})
+        if path == "/api/editor/strip":   # filmstrip thumbnails of one clip
+            project = resolve_project(arg("project"))
+            fname = os.path.basename(arg("file"))
+            if fname not in list_videos(project):
+                raise ApiError(404, "Video not found.")
+            try:
+                with open(strip_for(project, fname), "rb") as fh:
+                    return self.send_body(200, fh.read(), "image/jpeg", {"Cache-Control": "private, max-age=86400"})
+            except (ValueError, RuntimeError) as e:
+                raise ApiError(500, str(e))
+        if path.startswith("/api/editor/jobs/"):
+            with state_lock:
+                job = edit_jobs.get(path.rsplit("/", 1)[1])
+            if not job:
+                raise ApiError(404, "This job no longer exists (the server may have restarted).")
             return self.send_json(job_snapshot(job))
         if path == "/api/videos":
             return self.send_json(list_videos(resolve_project(arg("project"))))
@@ -1045,6 +1163,33 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         pass
 
+        if path == "/api/editor/save":
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            save_editor(project, editor.clean_timeline(body.get("timeline")))
+            return self.send_json({"ok": True})
+
+        if path == "/api/editor/export":
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            vdir = video_dir(project)
+            known = set(list_videos(project))
+
+            def duration_of(f):
+                return editor.probe_duration(os.path.join(vdir, f)) if f in known else None
+            try:
+                plan = editor.plan(body.get("timeline"), duration_of)
+            except ValueError as e:
+                raise ApiError(400, str(e))
+            save_editor(project, editor.clean_timeline(body.get("timeline")))
+            prune_jobs()
+            jid = uuid.uuid4().hex
+            with state_lock:
+                edit_jobs[jid] = dict(project=project, wanted=str(body.get("name") or ""), plan=plan, status="queued",
+                                      done=0, total=round(plan["total"], 1), fast=plan["fast"], created=time.time())
+            edit_q.put(jid)
+            return self.send_json({"id": jid})
+
         if path == "/api/video":
             body = self.read_json()
             project = resolve_project(body.get("project"))
@@ -1202,7 +1347,7 @@ def main():
     disable_console_quickedit()
     cleanup_stale_videos()
     cleanup_stale_uploads()
-    for target in (tts_worker, extract_worker, video_worker):
+    for target in (tts_worker, extract_worker, video_worker, edit_worker):
         threading.Thread(target=target, daemon=True, name=target.__name__).start()
     try:
         httpd = ThreadingHTTPServer((HOST, PORT), Handler)
