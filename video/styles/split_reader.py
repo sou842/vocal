@@ -134,7 +134,7 @@ class SplitReader(Style):
 
     # ---- static background
     def _art(self, image_path, w, h):
-        """The picture cropped to w x h (cover), recolored for the theme, darkened and vignetted, as float RGB."""
+        """The picture cropped to w x h (cover), at its original brightness, as float RGB."""
         im = Image.open(image_path).convert("RGB")
         if image_path == DEFAULT_IMAGE and self.t is not THEMES[DEFAULT_THEME]:
             # recolor the bundled purple art to the theme: rotate the hue, scale the saturation
@@ -149,12 +149,7 @@ class SplitReader(Style):
         left = (im.width - w) // 2
         top = min(max(0, round(im.height * 0.34)), im.height - h)
         a = np.asarray(im.crop((left, top, left + w, top + h))).astype(np.float32)
-        a *= 0.42                                                    # darker shade
-        if self.t is THEMES[DEFAULT_THEME]:
-            a = a * np.array([0.92, 0.88, 1.0], np.float32)          # keep the default art cool purple
-        yy, xx = np.mgrid[0:h, 0:w]
-        vig = 1.0 - 0.55 * (((xx - w * 0.5) / (w * 0.75)) ** 2 + ((yy - h * 0.55) / (h * 0.8)) ** 2)
-        return a * np.clip(vig, 0.3, 1)[..., None]
+        return a                                                     # shown as it is: no darkening, tint or vignette
 
     def _build_base(self, image_path):
         bg = np.array(self.c["bg"], np.float32)
