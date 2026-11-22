@@ -1,6 +1,8 @@
 /* Editing logic for the Editor page, without any DOM, so it can be tested with Node (see tests in the project notes).
    A timeline is {clips: [{file, start, end, join, join_len, uid}], fade_in, fade_out, fade_len} (same as the server's).
-   `lib` maps a clip's file name to its full length in seconds. Every function returns a NEW timeline; nothing is mutated. */
+   `lib` maps a clip's file name to its full length in seconds. Every function returns a NEW timeline; nothing is mutated.
+   The audio track is tl.audio: [{src: 'project'|'music', file, at, start, end, volume, fade_in, fade_out, uid}] where `at` is the
+   timeline time the piece begins; `alib` maps 'src:file' to its length. Volume 1 = unchanged, 0 = muted, up to 2. */
 (function (root) {
   const MIN_CLIP = 0.2, MIN_JOIN = 0.1;
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -33,8 +35,8 @@
   }
   /* true when the clips can be joined by copying (no trims, no fades, only cuts) */
   function isFastJoin(tl, lib) {
-    return tl.clips.length > 0 && !tl.fade_in && !tl.fade_out &&
-      tl.clips.every((c, i) => !isTrimmed(lib, c) && (!i || c.join === 'cut'));
+    return tl.clips.length > 0 && !tl.fade_in && !tl.fade_out && !(tl.audio && tl.audio.length) &&
+      tl.clips.every((c, i) => !isTrimmed(lib, c) && (!i || c.join === 'cut') && Math.abs((c.volume == null ? 1 : c.volume) - 1) < 0.01);
   }
 
   /* timeline time -> {i: clip index, offset: seconds into the clip, src: time inside the clip's file} */
@@ -111,6 +113,98 @@
     return idx;
   }
 
+
+  /* ---- the audio track */
+  const MAX_VOLUME = 2;
+  const aKey = a => a.src + ':' + a.file;
+  const aDur = (alib, a) => alib[aKey(a)] || 0;
+  const aStart = (alib, a) => Math.min(a.start || 0, Math.max(aDur(alib, a) - MIN_CLIP, 0));
+  const aEnd = (alib, a) => (a.end > 0 ? Math.min(a.end, aDur(alib, a)) : aDur(alib, a));
+  const aLen = (alib, a) => Math.max(0, aEnd(alib, a) - aStart(alib, a));
+  const audioList = tl => tl.audio || [];
+
+  /* which row each piece sits in, so pieces that overlap in time are drawn one under the other */
+  function audioRows(tl, alib) {
+    const items = audioList(tl).map((a, i) => ({ i, at: a.at, end: a.at + aLen(alib, a) })).sort((x, y) => x.at - y.at || x.i - y.i);
+    const rowEnds = [], rows = [];
+    items.forEach(it => {
+      let r = rowEnds.findIndex(e => e <= it.at + 1e-6);
+      if (r < 0) { r = rowEnds.length; rowEnds.push(0); }
+      rowEnds[r] = it.end;
+      rows[it.i] = r;
+    });
+    return { rows, count: Math.max(rowEnds.length, 1) };
+  }
+  function addAudio(tl, item, at, nextUid) {
+    const out = copy(tl);
+    out.audio = audioList(out);
+    out.audio.push({ src: item.src, file: item.file, at: Math.max(0, round2(at)), start: 0, end: 0, volume: 1, fade_in: 0, fade_out: 0, uid: nextUid() });
+    return out;
+  }
+  function moveAudio(tl, i, at) {
+    const out = copy(tl);
+    out.audio[i].at = Math.max(0, round2(at));
+    return out;
+  }
+  /* trim a piece's start: the piece's left edge moves and what stays is still heard at the same time (so `at` moves with it) */
+  function trimAudioStart(tl, alib, i, newStart) {
+    const out = copy(tl), a = out.audio[i];
+    const cur = aStart(alib, a), end = aEnd(alib, a);
+    let target = clamp(newStart, 0, Math.max(end - MIN_CLIP, 0));
+    let delta = target - cur;
+    if (a.at + delta < 0) { delta = -a.at; target = cur + delta; }
+    a.start = target < 0.05 ? 0 : round2(target);
+    a.at = Math.max(0, round2(a.at + delta));
+    return out;
+  }
+  function trimAudioEnd(tl, alib, i, newEnd) {
+    const out = copy(tl), a = out.audio[i], d = aDur(alib, a);
+    const e = clamp(newEnd, aStart(alib, a) + MIN_CLIP, d);
+    a.end = e >= d - 0.05 ? 0 : round2(e);
+    return out;
+  }
+  /* volume, fades or position of a piece; every value is kept in range */
+  function setAudioProp(tl, alib, i, patch) {
+    const out = copy(tl), a = out.audio[i];
+    if (patch.volume != null) a.volume = clamp(patch.volume, 0, MAX_VOLUME);
+    if (patch.at != null) a.at = Math.max(0, round2(patch.at));
+    const len = aLen(alib, a);
+    if (patch.fade_in != null) a.fade_in = clamp(patch.fade_in, 0, Math.min(30, len));
+    if (patch.fade_out != null) a.fade_out = clamp(patch.fade_out, 0, Math.min(30, len));
+    return out;
+  }
+  function removeAudio(tl, i) {
+    const out = copy(tl);
+    out.audio.splice(i, 1);
+    return out;
+  }
+  function duplicateAudio(tl, alib, i, nextUid) {
+    const out = copy(tl), a = out.audio[i];
+    out.audio.splice(i + 1, 0, Object.assign({}, a, { at: round2(a.at + aLen(alib, a)), uid: nextUid() }));
+    return out;
+  }
+  /* set a video clip's own volume (0 = muted) */
+  function setClipVolume(tl, i, v) {
+    const out = copy(tl);
+    out.clips[i].volume = round2(clamp(v, 0, MAX_VOLUME));
+    return out;
+  }
+  /* a piece dragged near 0 or a video clip edge (or another piece's edge) snaps to it. Returns the snapped time. */
+  function snapAt(tl, lib, alib, movingIndex, at, threshold) {
+    const L = layout(tl, lib), len = movingIndex >= 0 ? aLen(alib, tl.audio[movingIndex]) : 0;
+    const marks = [0, L.total];
+    L.starts.forEach((st, k) => { marks.push(st, st + L.lens[k]); });
+    audioList(tl).forEach((a, k) => { if (k !== movingIndex) marks.push(a.at, a.at + aLen(alib, a)); });
+    let best = at, bestD = threshold;
+    marks.forEach(m => {
+      [[m, m], [m - len, m]].forEach(([cand]) => {   // the piece's start, or its end, lands on the mark
+        const d = Math.abs(cand - at);
+        if (d < bestD && cand >= 0) { best = cand; bestD = d; }
+      });
+    });
+    return best;
+  }
+
   /* undo / redo of whole timelines */
   class History {
     constructor(limit = 100) { this.limit = limit; this.undoStack = []; this.redoStack = []; }
@@ -123,7 +217,9 @@
   }
 
   const api = { MIN_CLIP, clamp, copy, clipLen, startOf, endOf, isTrimmed, layout, joinLen, exportLength, isFastJoin, locate,
-                toTimelineTime, setTrim, resetTrim, splitAt, moveClip, removeClip, duplicateClip, dropIndex, History };
+                toTimelineTime, setTrim, resetTrim, splitAt, moveClip, removeClip, duplicateClip, dropIndex, History,
+                MAX_VOLUME, aKey, aDur, aStart, aEnd, aLen, audioRows, addAudio, moveAudio, trimAudioStart, trimAudioEnd,
+                setAudioProp, removeAudio, duplicateAudio, setClipVolume, snapAt };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.EditorCore = api;
 })(typeof window !== 'undefined' ? window : this);

@@ -447,9 +447,10 @@
           <!-- stage: tools | preview | panel -->
           <div class="grid gap-3 lg:grid-cols-[3.5rem_minmax(0,1fr)_21rem]" style="height: clamp(18rem, 46vh, 32rem)">
             <div class="card flex items-center gap-1.5 p-1.5 lg:flex-col lg:justify-start" role="tablist" aria-label="Editor tools">
-              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clips" title="Your clips" aria-label="Your clips"><i data-lucide="film"></i></button>
-              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clip" title="Selected clip" aria-label="Selected clip"><i data-lucide="sliders-horizontal"></i></button>
-              <button type="button" role="tab" class="flex size-11 cursor-pointer items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="finish" title="Finish and export" aria-label="Finish and export"><i data-lucide="sparkles"></i></button>
+              <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clips" title="Your clips" aria-label="Your clips"><i data-lucide="film"></i></button>
+              <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="audio" title="Audio: narration and music" aria-label="Audio"><i data-lucide="music"></i></button>
+              <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="clip" title="Selected clip" aria-label="Selected clip"><i data-lucide="sliders-horizontal"></i></button>
+              <button type="button" role="tab" class="flex size-9 cursor-pointer [&_svg]:size-4 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" data-tab="finish" title="Finish and export" aria-label="Finish and export"><i data-lucide="download"></i></button>
             </div>
             <div class="relative min-h-0 overflow-hidden rounded-xl border bg-black">
               <video id="edV0" class="absolute inset-0 size-full object-contain" preload="auto" playsinline></video>
@@ -458,6 +459,7 @@
               <div id="edClock" class="pointer-events-none absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-1 font-mono text-xs text-white tabular-nums"></div>
             </div>
             <div id="edPanel" class="card min-h-0 overflow-y-auto"></div>
+            <input type="file" id="edMusicFile" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*" hidden>
           </div>
 
           <!-- timeline -->
@@ -478,6 +480,7 @@
               <div id="edInner" class="relative select-none" style="min-height: 7.5rem; touch-action: pan-x">
                 <div id="edRuler" class="relative h-7 cursor-pointer border-b"></div>
                 <div id="edTrack" class="relative h-20"></div>
+                <div id="edAudioTrack" class="relative border-t bg-muted/30" style="height:2.5rem"></div>
                 <div id="edHead" class="pointer-events-none absolute top-0 bottom-0 z-20 w-0 border-l-2 border-primary" style="left:0">
                   <span class="absolute -left-[7px] -top-px size-3 rotate-45 rounded-[2px] bg-primary"></span>
                 </div>

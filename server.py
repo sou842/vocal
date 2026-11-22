@@ -663,6 +663,74 @@ def clip_infos(project):
     return out
 
 
+MUSIC_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac",
+               ".ogg": "audio/ogg", ".flac": "audio/flac"}
+MAX_MUSIC_BYTES = 28 * 1024 * 1024   # travels base64-encoded inside the 40 MB JSON limit
+
+
+def music_dir(project):
+    return os.path.join(project_dir(project), "music")
+
+
+def list_music(project):
+    d = music_dir(project)
+    if not os.path.isdir(d):
+        return []
+    return sorted((f for f in os.listdir(d) if os.path.splitext(f)[1].lower() in MUSIC_TYPES
+                   and os.path.isfile(os.path.join(d, f))), key=str.lower)
+
+
+def audio_path(project, src, fname):
+    """Full path of an audio-track file ('project' = a narration .wav of the project, 'music' = an uploaded file), or None."""
+    fname = os.path.basename(str(fname or ""))
+    if src == "project" and number_of(project, fname) is not None:
+        path = os.path.join(project_dir(project), fname)
+    elif src == "music" and fname in list_music(project):
+        path = os.path.join(music_dir(project), fname)
+    else:
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def audio_infos(project):
+    """The audio files available to the editor, with their length."""
+    out = []
+    for src, files in (("project", list_audio(project)), ("music", list_music(project))):
+        for f in files:
+            secs = editor.probe_duration(audio_path(project, src, f) or "")
+            if secs:
+                out.append({"src": src, "file": f, "seconds": round(secs, 2)})
+    return out
+
+
+def wave_for(project, src, fname):
+    """Path of the cached waveform PNG of an audio file (drawn on first use)."""
+    path = audio_path(project, src, fname)
+    if not path:
+        raise ApiError(404, "Audio not found.")
+    st = os.stat(path)
+    key = hashlib.sha1(f"{src}|{fname}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()[:16]
+    folder = os.path.join(project_dir(project), ".cache", "waves")
+    out = os.path.join(folder, key + ".png")
+    with strip_lock:
+        if not os.path.isfile(out):
+            os.makedirs(folder, exist_ok=True)
+            editor.make_wave(path, out)
+    return out
+
+
+def next_music_name(project, wanted):
+    stem, ext = os.path.splitext(os.path.basename(str(wanted or "")))
+    stem = re.sub(r"[^A-Za-z0-9_-]", "", stem.replace(" ", "_"))[:40] or "music"
+    ext = ext.lower()
+    existing = {f.lower() for f in list_music(project)}
+    name, n = stem + ext, 1
+    while name.lower() in existing:
+        n += 1
+        name = f"{stem}_{n}{ext}"
+    return name
+
+
 strip_lock = threading.Lock()   # thumbnails are made one at a time (each uses FFmpeg)
 
 
@@ -711,7 +779,8 @@ def edit_worker():
             def on_progress(done, total):
                 job_update(job, done=round(done, 1), total=round(total, 1))
 
-            editor.export(job["plan"], lambda f: os.path.join(vdir, f), out, on_progress)
+            editor.export(job["plan"], lambda f: os.path.join(vdir, f), out, on_progress,
+                          lambda src, f: audio_path(job["project"], src, f))
             job_update(job, status="done", file=name, seconds=round(job["plan"]["total"], 1), took=round(time.time() - t0))
         except Exception as e:
             if out:
@@ -895,7 +964,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(job_snapshot(job))
         if path == "/api/editor":   # clips available in this project + the saved timeline
             project = resolve_project(arg("project"))
-            return self.send_json({"clips": clip_infos(project), "timeline": load_editor(project)})
+            return self.send_json({"clips": clip_infos(project), "audio": audio_infos(project), "timeline": load_editor(project)})
+        if path == "/api/editor/wave":   # waveform picture of one audio file
+            project = resolve_project(arg("project"))
+            try:
+                with open(wave_for(project, arg("src"), arg("file")), "rb") as fh:
+                    return self.send_body(200, fh.read(), "image/png", {"Cache-Control": "private, max-age=86400"})
+            except (ValueError, RuntimeError) as e:
+                raise ApiError(500, str(e))
         if path == "/api/editor/strip":   # filmstrip thumbnails of one clip
             project = resolve_project(arg("project"))
             fname = os.path.basename(arg("file"))
@@ -952,6 +1028,12 @@ class Handler(BaseHTTPRequestHandler):
                 fname = os.path.basename(parts[3])
                 if number_of(project, fname) is not None:
                     return self.send_audio(os.path.join(project_dir(project), fname))
+            if len(parts) == 5 and parts[3] == "music":
+                project = resolve_project(parts[2])
+                fname = os.path.basename(parts[4])
+                if fname in list_music(project):
+                    return self.send_audio(os.path.join(music_dir(project), fname),
+                                           MUSIC_TYPES.get(os.path.splitext(fname)[1].lower(), "audio/mpeg"))
             if len(parts) == 5 and parts[3] == "videos" and parts[4].lower().endswith(".mp4"):
                 project = resolve_project(parts[2])
                 fname = os.path.basename(parts[4])
@@ -1169,6 +1251,39 @@ class Handler(BaseHTTPRequestHandler):
             save_editor(project, editor.clean_timeline(body.get("timeline")))
             return self.send_json({"ok": True})
 
+        if path == "/api/editor/music":   # upload a music file into this project
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            ext = os.path.splitext(os.path.basename(str(body.get("name") or "")))[1].lower()
+            if ext not in MUSIC_TYPES:
+                raise ApiError(400, "Choose an audio file: " + ", ".join(sorted(MUSIC_TYPES)) + ".")
+            try:
+                raw = base64.b64decode(str(body.get("data") or ""), validate=True)
+            except (binascii.Error, ValueError):
+                raise ApiError(400, "The file could not be read.")
+            if not raw or len(raw) > MAX_MUSIC_BYTES:
+                raise ApiError(400 if not raw else 413, "The audio file is empty or too large (max 28 MB).")
+            os.makedirs(music_dir(project), exist_ok=True)
+            with audio_lock:
+                name = next_music_name(project, body.get("name"))
+                dest = os.path.join(music_dir(project), name)
+                with open(dest, "wb") as fh:
+                    fh.write(raw)
+            secs = editor.probe_duration(dest)
+            if not secs:
+                os.remove(dest)
+                raise ApiError(400, "That file is not a readable audio file.")
+            return self.send_json({"src": "music", "file": name, "seconds": round(secs, 2)})
+
+        if path == "/api/editor/music/delete":
+            body = self.read_json()
+            project = resolve_project(body.get("project"))
+            fp = audio_path(project, "music", body.get("file"))
+            if not fp:
+                raise ApiError(404, "Music file not found.")
+            os.remove(fp)
+            return self.send_json({"ok": True})
+
         if path == "/api/editor/export":
             body = self.read_json()
             project = resolve_project(body.get("project"))
@@ -1177,8 +1292,11 @@ class Handler(BaseHTTPRequestHandler):
 
             def duration_of(f):
                 return editor.probe_duration(os.path.join(vdir, f)) if f in known else None
+            def audio_duration_of(src, f):
+                p_ = audio_path(project, src, f)
+                return editor.probe_duration(p_) if p_ else None
             try:
-                plan = editor.plan(body.get("timeline"), duration_of)
+                plan = editor.plan(body.get("timeline"), duration_of, audio_duration_of)
             except ValueError as e:
                 raise ApiError(400, str(e))
             save_editor(project, editor.clean_timeline(body.get("timeline")))

@@ -1414,7 +1414,8 @@ async function loadVideos(){
    The timeline (ed.tl) is saved to the server a moment after every change. */
 const EC = EditorCore;
 const ed = {
-  lib: {}, tl: {clips: [], fade_in: false, fade_out: false, fade_len: 1}, sel: -1, t: 0, playing: false,
+  lib: {}, tl: {clips: [], fade_in: false, fade_out: false, fade_len: 1, audio: []}, sel: -1, t: 0, playing: false,
+  alib: {}, audioFiles: [], asel: -1, live: null,   // audio track: file lengths, the files available, selected piece, slider edit in progress
   z: 40, tab: 'clips', jobId: null, uid: 0, saveTimer: null, hist: new EC.History(), name: '',
   cur: 0, pi: 0, prep: null, raf: 0, drag: null, loadTok: [0, 0], fitted: false,
 };
@@ -1424,6 +1425,12 @@ const edUrl = f => videoUrl(curProject(), f);
 const edStrip = f => qp('/api/editor/strip', {project: curProject(), file: f}) + '&v=' + (ed.lib[f] || 0);
 const edL = () => EC.layout(ed.tl, ed.lib);
 const edClip = i => ed.tl.clips[i];
+const edAudioUrl = a => '/projects/' + encodeURIComponent(curProject()) + (a.src === 'music' ? '/music/' : '/') + encodeURIComponent(a.file);
+const edWave = a => qp('/api/editor/wave', {project: curProject(), src: a.src, file: a.file}) + '&v=' + (EC.aDur(ed.alib, a) || 0);
+const edVol = c => (c && c.volume != null ? c.volume : 1);
+const edPct = v => Math.round(v * 100);
+const edPctText = v => (v < 0.005 ? 'Muted' : edPct(v) + '%');
+const AUD_H = 44;
 const edT = s => { s = Math.max(0, s || 0); return Math.floor(s / 60) + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
 const natural = (a, b) => a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
 const JOIN_LABELS = {cut: 'Cut', fade: 'Crossfade', dip: 'Dip to black'};
@@ -1438,11 +1445,14 @@ async function loadEditor(){
   try { r = await api.get(qp('/api/editor', {project: p})); } catch (e){ toast(e.message); return; }
   if (p !== curProject() || currentRoute() !== 'editor') return;
   edPause();
-  ed.lib = {};
-  r.clips.forEach(c => { ed.lib[c.file] = c.seconds; });
-  const saved = r.timeline.clips;
-  ed.tl = {...r.timeline, clips: saved.filter(c => ed.lib[c.file]).map(c => ({...c, uid: ++ed.uid}))};
+  edStopAudio();
+  edSetLib(r);
+  const saved = r.timeline.clips, savedAudio = r.timeline.audio || [];
+  const audio = savedAudio.filter(a => ed.alib[a.src + ':' + a.file]).map(a => ({...a, uid: ++ed.uid}));
+  ed.tl = {...r.timeline, clips: saved.filter(c => ed.lib[c.file]).map(c => ({...c, uid: ++ed.uid})), audio};
   if (ed.tl.clips.length < saved.length) toast(`${saved.length - ed.tl.clips.length} clip(s) were removed because their video files no longer exist.`, 5000);
+  if (audio.length < savedAudio.length) toast(`${savedAudio.length - audio.length} audio piece(s) were removed because their files no longer exist.`, 5000);
+  ed.asel = -1; ed.live = null;
   ed.hist.clear(); ed.sel = ed.tl.clips.length ? 0 : -1; ed.t = 0; ed.prep = null; ed.cur = 0; ed.pi = 0;
   edV.forEach(v => { v.removeAttribute('src'); delete v.dataset.file; v.load(); });
   ed.tab = ed.tl.clips.length ? 'clip' : 'clips';
@@ -1451,12 +1461,18 @@ async function loadEditor(){
   edRenderAll();
   edSeek(0);
 }
+function edSetLib(r){   // the clips and audio files the project has, with their lengths
+  ed.lib = {}; ed.alib = {};
+  r.clips.forEach(c => { ed.lib[c.file] = c.seconds; });
+  ed.audioFiles = r.audio || [];
+  ed.audioFiles.forEach(a => { ed.alib[a.src + ':' + a.file] = a.seconds; });
+}
 async function edRefreshLib(){   // after an export: show the new video in "Your clips" without touching the timeline
   const p = curProject();
   try {
     const r = await api.get(qp('/api/editor', {project: p}));
     if (p !== curProject() || currentRoute() !== 'editor') return;
-    r.clips.forEach(c => { ed.lib[c.file] = c.seconds; });
+    edSetLib(r);
     edRenderPanel();
   } catch (e){ /* cosmetic */ }
 }
@@ -1476,6 +1492,7 @@ function edCommit(next, opts = {}){
 function edAfterChange(){
   edPause();
   ed.sel = ed.tl.clips.length ? Math.min(ed.sel, ed.tl.clips.length - 1) : -1;
+  ed.asel = (ed.tl.audio || []).length ? Math.min(ed.asel, ed.tl.audio.length - 1) : -1;
   ed.t = EC.clamp(ed.t, 0, edL().total);
   ed.prep = null;
   edSave();
@@ -1496,7 +1513,7 @@ function edRenderChrome(){
   });
   $('edUndo').disabled = !ed.hist.canUndo; $('edRedo').disabled = !ed.hist.canRedo;
   $('edExport').disabled = !n || !!ed.jobId;
-  ['edSplit', 'edDup', 'edDel'].forEach(id => { $(id).disabled = !n || (id !== 'edSplit' && ed.sel < 0); });
+  ['edSplit', 'edDup', 'edDel'].forEach(id => { $(id).disabled = !n || (id !== 'edSplit' && ed.sel < 0 && ed.asel < 0); });
   ['edPrev', 'edPlay', 'edNext'].forEach(id => { $(id).disabled = !n; });
   $('edEmpty').hidden = n > 0;
   const exp = EC.exportLength(ed.tl, ed.lib);
@@ -1519,7 +1536,7 @@ function edPlayIcon(){
 const RULER_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
 function edRenderTimeline(){
   const L = edL(), z = ed.z, sc = $('edScroll');
-  const width = Math.max(sc.clientWidth, Math.ceil(L.total * z) + 240);
+  const width = Math.max(sc.clientWidth, Math.ceil(edSpan() * z) + 240);
   $('edInner').style.width = width + 'px';
 
   // ruler: a labelled tick at least ~90px apart, lighter ticks between
@@ -1559,7 +1576,44 @@ function edRenderTimeline(){
   if (!clips.length) html = '<div class="px-4 py-6 text-sm text-muted-foreground">The timeline is empty. Add clips from <b>Your clips</b>.</div>';
   $('edTrack').innerHTML = html;
   edLabels();
+  edRenderAudio();
   edPlayhead();
+}
+/* the whole length shown on the timeline: the video, or the audio if it runs longer */
+function edSpan(){
+  let end = edL().total;
+  (ed.tl.audio || []).forEach(a => { end = Math.max(end, a.at + EC.aLen(ed.alib, a)); });
+  return end;
+}
+/* the audio lane: a block per piece with its waveform, stacked in rows when pieces overlap in time */
+function edRenderAudio(){
+  const box = $('edAudioTrack'), z = ed.z, items = ed.tl.audio || [], L = edL();
+  if (!items.length){
+    box.style.height = '2.5rem';
+    box.innerHTML = '<div class="px-3 py-2.5 text-xs text-muted-foreground">Audio track: add narration or music with the <b>Audio</b> tool on the left.</div>';
+    return;
+  }
+  const {rows, count} = EC.audioRows(ed.tl, ed.alib);
+  box.style.height = (count * (AUD_H + 4) + 8) + 'px';
+  box.innerHTML = items.map((a, i) => {
+    const len = EC.aLen(ed.alib, a), s = EC.aStart(ed.alib, a), d = EC.aDur(ed.alib, a) || 1;
+    const w = Math.max(len * z, 8), on = i === ed.asel, past = Math.max(0, (a.at + len - L.total) * z);
+    return `<div class="group absolute cursor-pointer overflow-hidden rounded-md border-2 bg-emerald-800 ${on ? 'border-primary' : 'border-emerald-600/60'}"
+        style="left:${a.at * z}px;top:${4 + rows[i] * (AUD_H + 4)}px;width:${w}px;height:${AUD_H}px" data-ablock="${i}">
+      <div class="pointer-events-none absolute inset-0 opacity-80 mix-blend-screen" style="background:url('${edWave(a)}') ${-s * z}px 0 / ${d * z}px 100% no-repeat"></div>
+      ${past > 1 ? `<div class="pointer-events-none absolute inset-y-0 right-0 bg-black/60" style="width:${Math.min(past, w)}px" title="Past the end of the video: not heard"></div>` : ''}
+      <div class="pointer-events-none absolute inset-x-2.5 top-0.5 truncate text-[10px] font-medium leading-4 text-white drop-shadow" data-alabel="${i}"></div>
+      <div class="absolute inset-y-0 left-0 w-2.5 cursor-ew-resize bg-primary ${on ? '' : 'opacity-0 group-hover:opacity-80'}" data-ahandle="start" title="Drag to trim the start"></div>
+      <div class="absolute inset-y-0 right-0 w-2.5 cursor-ew-resize bg-primary ${on ? '' : 'opacity-0 group-hover:opacity-80'}" data-ahandle="end" title="Drag to trim the end"></div>
+    </div>`;
+  }).join('');
+  edAudioLabels();
+}
+function edAudioLabels(){
+  document.querySelectorAll('[data-alabel]').forEach(el => {
+    const a = (ed.tl.audio || [])[+el.dataset.alabel];
+    if (a) el.textContent = `${a.file.replace(/\.[^.]+$/, '')} · ${edPctText(a.volume)}`;
+  });
 }
 /* texts and sizes that change while a clip is being trimmed (cheap: no redraw of the filmstrips) */
 function edLabels(){
@@ -1576,8 +1630,8 @@ function edLayoutLive(){
     el.style.left = L.starts[i] * z + 'px'; el.style.width = Math.max(L.lens[i] * z - 2, 6) + 'px';
   });
   document.querySelectorAll('[data-marker]').forEach(el => { el.style.left = L.starts[+el.dataset.marker] * z + 'px'; });
-  $('edInner').style.width = Math.max($('edScroll').clientWidth, Math.ceil(L.total * z) + 240) + 'px';
-  edLabels(); edRenderClock();
+  $('edInner').style.width = Math.max($('edScroll').clientWidth, Math.ceil(edSpan() * z) + 240) + 'px';
+  edLabels(); edRenderClock(); edRenderAudio();
   $('edTotal').textContent = `${ed.tl.clips.length} clips · ${edT(L.total)}`;
 }
 function edPlayhead(){ $('edHead').style.left = ed.t * ed.z + 'px'; }
@@ -1633,9 +1687,63 @@ function edSeek(t){
   edLoadInto(ed.cur, loc.i, loc.src, () => { if (ed.playing) edV[ed.cur].play().catch(() => {}); });
   edPlayhead(); edRenderClock();
 }
+/* Sound in the preview goes through Web Audio, so volumes above 100% and fades work and everything is mixed live. */
+let edAC = null;
+const edVG = [null, null];      // volume of each of the two players
+const edAud = new Map();        // audio piece uid -> {el, g}
+function edEnsureAudioCtx(){
+  if (!edAC){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    edAC = new AC();
+    edV.forEach((v, k) => {
+      const g = edAC.createGain();
+      edAC.createMediaElementSource(v).connect(g);
+      g.connect(edAC.destination);
+      edVG[k] = g;
+    });
+  }
+  if (edAC.state === 'suspended') edAC.resume();
+  return true;
+}
+function edApplyClipGain(){
+  if (edVG[ed.cur]) edVG[ed.cur].gain.value = edVol(edClip(ed.pi));
+}
+function edSyncAudio(){   // start, stop and set the volume of every audio piece for the playhead position
+  if (!edAC) return;
+  const items = ed.tl.audio || [], seen = new Set(), t = ed.t;
+  items.forEach(a => {
+    seen.add(a.uid);
+    let o = edAud.get(a.uid);
+    if (!o){
+      const el = new Audio();
+      el.preload = 'auto'; el.src = edAudioUrl(a);
+      const g = edAC.createGain();
+      edAC.createMediaElementSource(el).connect(g);
+      g.connect(edAC.destination);
+      o = {el, g};
+      edAud.set(a.uid, o);
+    }
+    const len = EC.aLen(ed.alib, a), end = a.at + len;
+    if (t >= a.at && t < end){
+      const want = EC.aStart(ed.alib, a) + (t - a.at);
+      if (o.el.paused || Math.abs(o.el.currentTime - want) > 0.35){
+        try { o.el.currentTime = want; } catch (e){ /* not ready yet */ }
+        o.el.play().catch(() => {});
+      }
+      let g = a.volume;
+      if (a.fade_in > 0.01 && t - a.at < a.fade_in) g *= Math.max(0, (t - a.at) / a.fade_in);
+      if (a.fade_out > 0.01 && end - t < a.fade_out) g *= Math.max(0, (end - t) / a.fade_out);
+      o.g.gain.value = g;
+    } else if (!o.el.paused) o.el.pause();
+  });
+  edAud.forEach((o, uid) => { if (!seen.has(uid)){ o.el.pause(); edAud.delete(uid); } });   // removed from the timeline
+}
+function edStopAudio(){ edAud.forEach(o => o.el.pause()); edAud.clear(); }
 function edPlayStart(){
   const L = edL();
   if (!L.total) return;
+  edEnsureAudioCtx();
   if (ed.t >= L.total - 0.05) edSeek(0);
   ed.playing = true;
   edV[ed.cur].play().catch(() => {});
@@ -1646,6 +1754,7 @@ function edPlayStart(){
 function edPause(){
   ed.playing = false;
   edV.forEach(v => v.pause());
+  edAud.forEach(o => o.el.pause());
   cancelAnimationFrame(ed.raf);
   edPlayIcon();
 }
@@ -1662,6 +1771,7 @@ function edTick(){
       if (e - v.currentTime < 2 && ed.pi < ed.tl.clips.length - 1) edPrepare(ed.pi + 1);
     }
   }
+  edApplyClipGain(); edSyncAudio();
   edPlayhead(); edKeepVisible(); edRenderClock();
   ed.raf = requestAnimationFrame(edTick);
 }
@@ -1697,19 +1807,35 @@ $('edNext').onclick = () => {
 
 /* ---------------------------------------------------------------- pointer: scrub, select, reorder, trim */
 const edXToT = ev => Math.max(0, (ev.clientX - $('edInner').getBoundingClientRect().left) / ed.z);
-function edSelect(i){
-  ed.sel = i;
+function edMarkBlocks(){   // show which video clip is selected without redrawing the filmstrips
   document.querySelectorAll('[data-block]').forEach(el => {
-    const on = +el.dataset.block === i;
+    const on = +el.dataset.block === ed.sel;
     el.classList.toggle('border-primary', on); el.classList.toggle('border-transparent', !on);
     el.querySelectorAll('[data-handle]').forEach(h => { h.classList.toggle('opacity-0', !on); h.classList.toggle('group-hover:opacity-80', !on); });
   });
-  edRenderPanel(); edRenderChrome();
+}
+function edSelect(i){
+  ed.sel = i; ed.asel = -1;
+  edMarkBlocks(); edRenderAudio(); edRenderPanel(); edRenderChrome();
+}
+function edSelectAudio(i){
+  ed.asel = i; ed.sel = -1; ed.tab = 'clip';
+  edMarkBlocks(); edRenderAudio(); edRenderPanel(); edRenderChrome();
 }
 $('edInner').addEventListener('pointerdown', ev => {
   if (ev.button !== 0) return;
   const inner = $('edInner'), marker = ev.target.closest('[data-marker]');
   if (marker){ ed.tab = 'clip'; edSelect(+marker.dataset.marker); return; }
+  const ab = ev.target.closest('[data-ablock]');
+  if (ab){   // a piece of the audio track: move it, or trim one of its edges
+    const i = +ab.dataset.ablock, ah = ev.target.closest('[data-ahandle]');
+    if (i !== ed.asel || ed.sel >= 0) edSelectAudio(i);
+    ed.drag = ah ? {kind: 'atrim', i, side: ah.dataset.ahandle, x0: ev.clientX, base: EC.copy(ed.tl)}
+                 : {kind: 'amove', i, x0: ev.clientX, moved: false, base: EC.copy(ed.tl)};
+    inner.setPointerCapture(ev.pointerId);
+    ev.preventDefault();
+    return;
+  }
   const block = ev.target.closest('[data-block]'), handle = ev.target.closest('[data-handle]');
   if (block && handle){
     const i = +block.dataset.block;
@@ -1742,6 +1868,22 @@ $('edInner').addEventListener('pointermove', ev => {
     edLoadInto(ed.cur, d.i, d.side === 'start' ? EC.startOf(ed.lib, c) : Math.max(EC.endOf(ed.lib, c) - 0.05, 0));
     return;
   }
+  if (d.kind === 'atrim'){
+    const a0 = d.base.audio[d.i], dt = (ev.clientX - d.x0) / ed.z;
+    ed.tl = d.side === 'start' ? EC.trimAudioStart(d.base, ed.alib, d.i, EC.aStart(ed.alib, a0) + dt)
+                               : EC.trimAudioEnd(d.base, ed.alib, d.i, EC.aEnd(ed.alib, a0) + dt);
+    edLayoutLive();
+    return;
+  }
+  if (d.kind === 'amove'){
+    const dx = ev.clientX - d.x0;
+    if (!d.moved && Math.abs(dx) < 4) return;
+    d.moved = true;
+    const at = EC.snapAt(d.base, ed.lib, ed.alib, d.i, d.base.audio[d.i].at + dx / ed.z, 8 / ed.z);   // sticks to 0 and to clip edges
+    ed.tl = EC.moveAudio(d.base, d.i, at);
+    edLayoutLive();
+    return;
+  }
   if (d.kind === 'block'){
     const dx = ev.clientX - d.x0;
     if (!d.moved && Math.abs(dx) < 6) return;
@@ -1762,6 +1904,9 @@ function edPointerEnd(ev){
   if (d.kind === 'trim'){
     if (JSON.stringify(ed.tl) !== JSON.stringify(d.base)){ ed.hist.push(d.base); edAfterChange(); }
     else edRenderTimeline();
+  } else if (d.kind === 'atrim' || d.kind === 'amove'){
+    if (JSON.stringify(ed.tl) !== JSON.stringify(d.base)){ ed.hist.push(d.base); edAfterChange(); }
+    else edRenderAudio();
   } else if (d.kind === 'block'){
     if (d.moved && d.to !== d.i){ edCommit(EC.moveClip(ed.tl, d.i, d.to), {select: d.to}); }
     else if (d.moved) edRenderTimeline();
@@ -1777,12 +1922,21 @@ function edSplitHere(){
   edCommit(r.tl, {select: r.index});
 }
 function edDelete(){
+  if (ed.asel >= 0){ edCommit(EC.removeAudio(ed.tl, ed.asel)); return; }
   if (ed.sel < 0) return;
   edCommit(EC.removeClip(ed.tl, ed.sel), {select: ed.sel});
 }
 function edDuplicate(){
+  if (ed.asel >= 0){ const n = EC.duplicateAudio(ed.tl, ed.alib, ed.asel, () => ++ed.uid); ed.asel++; edCommit(n); return; }
   if (ed.sel < 0) return;
   edCommit(EC.duplicateClip(ed.tl, ed.sel, () => ++ed.uid), {select: ed.sel + 1});
+}
+/* put a piece of narration or music on the audio track, at the playhead */
+function edAddAudio(src, file){
+  const at = EC.snapAt(ed.tl, ed.lib, ed.alib, -1, ed.t, 8 / ed.z);
+  const next = EC.addAudio(ed.tl, {src, file}, at, () => ++ed.uid);
+  ed.asel = next.audio.length - 1; ed.sel = -1; ed.tab = 'clip';
+  edCommit(next);
 }
 function edAdd(files){
   const next = EC.copy(ed.tl);
@@ -1824,7 +1978,72 @@ window.addEventListener('hashchange', () => { if (currentRoute() !== 'editor') e
 /* ---------------------------------------------------------------- side panel */
 function edRenderPanel(){
   const box = $('edPanel');
-  box.innerHTML = ed.tab === 'clips' ? edPanelClips() : ed.tab === 'clip' ? edPanelClip() : edPanelFinish();
+  box.innerHTML = ed.tab === 'clips' ? edPanelClips() : ed.tab === 'audio' ? edPanelAudio()
+    : ed.tab === 'clip' ? (ed.asel >= 0 ? edPanelAudioItem() : edPanelClip()) : edPanelFinish();
+}
+const SLIDER = 'w-full';
+function edPanelAudio(){
+  const row = a => {
+    const used = (ed.tl.audio || []).filter(x => x.src === a.src && x.file === a.file).length;
+    return `<div class="flex items-center gap-2 px-4 py-2.5">
+      <div class="min-w-0 flex-1"><div class="truncate font-mono text-xs" title="${esc(a.file)}">${esc(a.file)}</div>
+        <div class="hint">${edT(a.seconds)}${used ? ` · on timeline${used > 1 ? ' ×' + used : ''}` : ''}</div></div>
+      ${a.src === 'music' ? `<button type="button" class="btn btn-ghost btn-icon btn-sm" data-pa="delmusic" data-file="${esc(a.file)}" title="Delete this music file" aria-label="Delete ${esc(a.file)}">${lu('trash-2')}</button>` : ''}
+      <button type="button" class="btn btn-outline btn-sm" data-pa="addaudio" data-src="${a.src}" data-file="${esc(a.file)}">${lu('plus')}Add</button>
+    </div>`;
+  };
+  const narr = ed.audioFiles.filter(a => a.src === 'project'), music = ed.audioFiles.filter(a => a.src === 'music');
+  return `
+    <div class="flex items-center justify-between gap-2 border-b px-4 py-3">
+      <div class="font-semibold">Audio</div>
+      <button type="button" class="btn btn-outline btn-sm" data-pa="upload">${lu('upload')}Add music file</button>
+    </div>
+    <p class="hint px-4 pt-3">Pieces are added at the playhead. Drag them on the audio track to move them.</p>
+    <div class="px-4 pb-1 pt-3 text-xs font-medium text-muted-foreground">Music you added</div>
+    <div class="divide-y">${music.length ? music.map(row).join('') : '<div class="px-4 py-3 text-sm text-muted-foreground">None yet. Use <b>Add music file</b> (mp3, wav, m4a, ogg, flac; up to 28 MB).</div>'}</div>
+    <div class="px-4 pb-1 pt-4 text-xs font-medium text-muted-foreground">Narration of this project</div>
+    <div class="divide-y">${narr.length ? narr.map(row).join('') : '<div class="px-4 py-3 text-sm text-muted-foreground">No audio generated yet.</div>'}</div>`;
+}
+function edPanelAudioItem(){
+  const i = ed.asel, a = (ed.tl.audio || [])[i];
+  if (!a) return `<div class="px-5 py-10 text-center text-sm text-muted-foreground">Click a piece on the audio track to adjust it.</div>`;
+  const d = EC.aDur(ed.alib, a), s = EC.aStart(ed.alib, a), e = EC.aEnd(ed.alib, a), len = e - s, field = 'input h-8 w-full py-0 text-xs';
+  const past = a.at + len - edL().total;
+  return `
+    <div class="border-b px-4 py-3">
+      <div class="hint">Audio piece ${i + 1} of ${ed.tl.audio.length} · ${a.src === 'music' ? 'music' : 'narration'}</div>
+      <div class="truncate font-mono text-xs" title="${esc(a.file)}">${esc(a.file)}</div>
+      <div class="hint">${edT(len)}${len < d - 0.05 ? ` (trimmed from ${edT(d)})` : ''} · from ${edT(a.at)} to ${edT(a.at + len)}</div>
+    </div>
+    <div class="space-y-4 p-4">
+      <div>
+        <div class="mb-2 flex items-center justify-between"><span class="label">Volume</span><span class="hint tabular-nums" data-vol-label>${edPctText(a.volume)}</span></div>
+        <input type="range" min="0" max="200" step="5" value="${edPct(a.volume)}" class="${SLIDER}" data-in="avol" aria-label="Volume">
+        <div class="mt-2 flex gap-2">
+          <button type="button" class="btn btn-outline btn-sm" data-pa="amute">${lu(a.volume < 0.005 ? 'volume-2' : 'volume-x')}${a.volume < 0.005 ? 'Unmute' : 'Mute'}</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-pa="avol100" ${Math.abs(a.volume - 1) < 0.01 ? 'hidden' : ''}>Reset to 100%</button>
+        </div>
+        <p class="hint mt-1">100% is the file as it is. Above 100% makes it louder (it may distort).</p>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="text-xs">Fade in (s)<input type="number" class="${field}" min="0" max="${Math.min(30, len).toFixed(1)}" step="0.5" value="${a.fade_in}" data-in="afadein"></label>
+        <label class="text-xs">Fade out (s)<input type="number" class="${field}" min="0" max="${Math.min(30, len).toFixed(1)}" step="0.5" value="${a.fade_out}" data-in="afadeout"></label>
+      </div>
+      <div>
+        <div class="label mb-2">Position and trim <span class="hint font-normal">(seconds)</span></div>
+        <div class="grid grid-cols-3 gap-2">
+          <label class="text-xs">Starts at<input type="number" class="${field}" min="0" step="0.1" value="${+a.at.toFixed(2)}" data-in="aat"></label>
+          <label class="text-xs">From<input type="number" class="${field}" min="0" max="${d}" step="0.1" value="${+s.toFixed(2)}" data-in="astart"></label>
+          <label class="text-xs">To<input type="number" class="${field}" min="0" max="${d}" step="0.1" value="${+e.toFixed(2)}" data-in="aend"></label>
+        </div>
+        <button type="button" class="btn btn-outline btn-sm mt-2" data-pa="ahere">${lu('map-pin')}Start at the playhead</button>
+        ${past > 0.05 ? `<p class="hint mt-1.5 text-destructive">The last ${edT(past)} runs past the end of the video and will be cut off.</p>` : ''}
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <button type="button" class="btn btn-outline btn-sm" data-pa="adup">${lu('copy')}Duplicate</button>
+        <button type="button" class="btn btn-outline btn-sm text-destructive" data-pa="adel">${lu('trash-2')}Remove</button>
+      </div>
+    </div>`;
 }
 function edPanelClips(){
   const files = Object.keys(ed.lib).sort(natural);
@@ -1871,6 +2090,14 @@ function edPanelClip(){
           <input type="number" class="input h-8 w-24 py-0 text-xs" min="0.1" max="5" step="0.1" value="${c.join_len}" data-in="joinlen"></label>
         <p class="hint mt-1">${c.join === 'cut' ? 'A cut is instant.' : 'The two clips overlap during the transition. It shows in the exported video, not in the preview.'}</p>
       </div>` : ''}
+      <div>
+        <div class="mb-2 flex items-center justify-between"><span class="label">Volume of the clip's own sound</span><span class="hint tabular-nums" data-vol-label>${edPctText(edVol(c))}</span></div>
+        <input type="range" min="0" max="200" step="5" value="${edPct(edVol(c))}" class="${SLIDER}" data-in="cvol" aria-label="Clip volume">
+        <div class="mt-2 flex gap-2">
+          <button type="button" class="btn btn-outline btn-sm" data-pa="cmute">${lu(edVol(c) < 0.005 ? 'volume-2' : 'volume-x')}${edVol(c) < 0.005 ? 'Unmute' : 'Mute'}</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-pa="cvol100" ${Math.abs(edVol(c) - 1) < 0.01 ? 'hidden' : ''}>Reset to 100%</button>
+        </div>
+      </div>
       <div class="grid grid-cols-2 gap-2">
         <button type="button" class="btn btn-outline btn-sm" data-pa="up" ${i ? '' : 'disabled'}>${lu('arrow-left')}Move earlier</button>
         <button type="button" class="btn btn-outline btn-sm" data-pa="down" ${i < n - 1 ? '' : 'disabled'}>Move later${lu('arrow-right')}</button>
@@ -1899,7 +2126,8 @@ function edPanelFinish(){
       <div class="rounded-lg bg-muted p-3 text-xs">
         <div class="flex justify-between"><span>Clips</span><b>${n}</b></div>
         <div class="flex justify-between"><span>Length</span><b>${edT(exp)}</b></div>
-        <div class="mt-1.5 text-muted-foreground">${!n ? '' : EC.isFastJoin(ed.tl, ed.lib) ? 'Only cuts and no trims: the clips are joined without re-encoding (instant, no quality loss).' : 'Trims, fades or transitions need the video to be re-encoded. Long videos take a few minutes.'}</div>
+        <div class="flex justify-between"><span>Audio pieces</span><b>${(ed.tl.audio || []).length}</b></div>
+        <div class="mt-1.5 text-muted-foreground">${!n ? '' : EC.isFastJoin(ed.tl, ed.lib) ? 'Only cuts and no trims: the clips are joined without re-encoding (instant, no quality loss).' : 'Trims, fades, transitions, volume changes or an audio track need the video to be re-encoded. Long videos take a few minutes.'}</div>
       </div>
       <button type="button" class="btn btn-primary w-full" data-pa="export" ${n && !ed.jobId ? '' : 'disabled'}>${lu('clapperboard')}Export video</button>
     </div>`;
@@ -1908,8 +2136,18 @@ function edPanelFinish(){
 $('edPanel').addEventListener('click', ev => {
   const b = ev.target.closest('[data-pa]');
   if (!b || b.disabled) return;
-  const act = b.dataset.pa, i = ed.sel, c = edClip(i);
+  const act = b.dataset.pa, i = ed.sel, c = edClip(i), ai = ed.asel;
   if (act === 'add') edAdd([b.dataset.file]);
+  else if (act === 'addaudio') edAddAudio(b.dataset.src, b.dataset.file);
+  else if (act === 'upload') $('edMusicFile').click();
+  else if (act === 'delmusic') edDeleteMusic(b.dataset.file);
+  else if (act === 'amute' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {volume: ed.tl.audio[ai].volume < 0.005 ? 1 : 0}));
+  else if (act === 'avol100' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {volume: 1}));
+  else if (act === 'ahere' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {at: ed.t}));
+  else if (act === 'adup') edDuplicate();
+  else if (act === 'adel') edDelete();
+  else if (act === 'cmute' && c) edCommit(EC.setClipVolume(ed.tl, i, edVol(c) < 0.005 ? 1 : 0));
+  else if (act === 'cvol100' && c) edCommit(EC.setClipVolume(ed.tl, i, 1));
   else if (act === 'addall'){
     const have = new Set(ed.tl.clips.map(x => x.file));
     const files = Object.keys(ed.lib).sort(natural).filter(f => !have.has(f));
@@ -1929,9 +2167,15 @@ $('edPanel').addEventListener('click', ev => {
   else if (act === 'export') edExport();
 });
 $('edPanel').addEventListener('change', ev => {
-  const t = ev.target, key = t.dataset.in, i = ed.sel, c = edClip(i);
+  const t = ev.target, key = t.dataset.in, i = ed.sel, c = edClip(i), ai = ed.asel;
   if (!key || key === 'name') return;
-  if (key === 'start' && c) edCommit(EC.setTrim(ed.tl, ed.lib, i, {start: parseFloat(t.value) || 0}));
+  if (key === 'avol' || key === 'cvol'){ edFinishLive(); edRenderPanel(); return; }
+  if (key === 'aat' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {at: parseFloat(t.value) || 0}));
+  else if (key === 'astart' && ai >= 0) edCommit(EC.trimAudioStart(ed.tl, ed.alib, ai, parseFloat(t.value) || 0));
+  else if (key === 'aend' && ai >= 0) edCommit(EC.trimAudioEnd(ed.tl, ed.alib, ai, parseFloat(t.value) || 0));
+  else if (key === 'afadein' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {fade_in: parseFloat(t.value) || 0}));
+  else if (key === 'afadeout' && ai >= 0) edCommit(EC.setAudioProp(ed.tl, ed.alib, ai, {fade_out: parseFloat(t.value) || 0}));
+  else if (key === 'start' && c) edCommit(EC.setTrim(ed.tl, ed.lib, i, {start: parseFloat(t.value) || 0}));
   else if (key === 'end' && c) edCommit(EC.setTrim(ed.tl, ed.lib, i, {end: parseFloat(t.value) || 0}));
   else if (key === 'join' && c){ const n = EC.copy(ed.tl); n.clips[i].join = t.value; edCommit(n); }
   else if (key === 'joinlen' && c){ const n = EC.copy(ed.tl); n.clips[i].join_len = EC.clamp(parseFloat(t.value) || 0.8, 0.1, 5); edCommit(n); }
@@ -1940,7 +2184,50 @@ $('edPanel').addEventListener('change', ev => {
   else if (key === 'fadelen'){ const n = EC.copy(ed.tl); n.fade_len = EC.clamp(parseFloat(t.value) || 1, 0.2, 5); edCommit(n); }
   edRenderPanel();   // show the clamped value
 });
-$('edPanel').addEventListener('input', ev => { if (ev.target.dataset.in === 'name') ed.name = ev.target.value; });
+$('edPanel').addEventListener('input', ev => {
+  const t = ev.target, key = t.dataset.in;
+  if (key === 'name'){ ed.name = t.value; return; }
+  if (key !== 'avol' && key !== 'cvol') return;
+  // a volume slider: heard at once (also while playing); one undo step is recorded when the slider is released
+  if (!ed.live) ed.live = EC.copy(ed.tl);
+  const v = (+t.value) / 100;
+  ed.tl = key === 'avol' ? EC.setAudioProp(ed.tl, ed.alib, ed.asel, {volume: v}) : EC.setClipVolume(ed.tl, ed.sel, v);
+  const label = $('edPanel').querySelector('[data-vol-label]');
+  if (label) label.textContent = edPctText(v);
+  edAudioLabels(); edApplyClipGain();
+});
+function edFinishLive(){
+  if (!ed.live) return;
+  const base = ed.live;
+  ed.live = null;
+  if (JSON.stringify(base) !== JSON.stringify(ed.tl)){ ed.hist.push(base); edSave(); edRenderChrome(); }
+}
+async function edDeleteMusic(file){
+  if (!confirm(`Delete the music file "${file}" from this project? Pieces that use it are removed from the timeline.`)) return;
+  try {
+    await api.post('/api/editor/music/delete', {project: curProject(), file});
+    ed.audioFiles = ed.audioFiles.filter(a => !(a.src === 'music' && a.file === file));
+    delete ed.alib['music:' + file];
+    const next = EC.copy(ed.tl);
+    next.audio = (next.audio || []).filter(a => !(a.src === 'music' && a.file === file));
+    edCommit(next);
+    edRenderPanel();
+  } catch (e){ toast(e.message, 5000); }
+}
+$('edMusicFile').onchange = async () => {   // upload a music file, then put it on the track at the playhead
+  const f = $('edMusicFile').files[0];
+  $('edMusicFile').value = '';
+  if (!f) return;
+  if (f.size > 28 * 1024 * 1024){ toast('That file is too large (max 28 MB).', 5000); return; }
+  toast('Adding ' + f.name + '...');
+  try {
+    const r = await api.post('/api/editor/music', {project: curProject(), name: f.name, data: await readB64(f)});
+    ed.alib[r.src + ':' + r.file] = r.seconds;
+    ed.audioFiles.push(r);
+    toast('Added ' + r.file);
+    edAddAudio(r.src, r.file);
+  } catch (e){ toast(e.message, 6000); }
+};
 
 /* ---------------------------------------------------------------- export */
 async function edExport(){
