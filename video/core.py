@@ -155,3 +155,22 @@ def make_video(style_id, audio_path, text, out_path, options=None, on_status=Non
         on_status("rendering")
     render(style_id, audio_path, words, duration, out_path, options, on_progress)
     return duration
+
+
+_SAMPLE = ("The old lighthouse stood alone on the cliff, watching the grey sea. Every night, its light swept across the "
+           "water and guided the fishermen safely home. Nobody remembered who had built it. Some said it was older than "
+           "the village itself, and that it would outlast them all.")
+
+
+def preview_frame(style_id, options, text=None):
+    """One still frame of a style with the given options, for the live preview. Uses the start of `text` (or sample
+    text) with made-up word timings, shown a little into the second sentence so every text colour is visible."""
+    words, t = [], 0.6
+    for w in (text or "").split()[:70] or _SAMPLE.split():
+        d = 0.18 + 0.03 * len(w)
+        words.append({"w": w, "start": round(t, 3), "end": round(t + d, 3)})
+        t += d + (0.35 if w[-1] in ".!?" else 0.03)
+    style = STYLES[style_id](words, t + 2, options or {})
+    sent_ends = [i for i, w in enumerate(words) if w["w"][-1] in ".!?"]
+    k = (sent_ends[0] + 1 + 3) if sent_ends and sent_ends[0] + 4 < len(words) else min(4, len(words) - 1)
+    return style.frame((words[k]["start"] + words[k]["end"]) / 2).convert("RGB")

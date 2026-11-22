@@ -7,7 +7,21 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..core import ASSETS, H, W, Style, register
 
-SERIF = r"C:\Windows\Fonts\georgia.ttf"
+FONT_DIR = r"C:\Windows\Fonts"
+SERIF = os.path.join(FONT_DIR, "georgia.ttf")
+# Fonts the user can pick (Windows system fonts): id, label, file, CSS family (for the preview in the page).
+_FONTS = [
+    ("georgia", "Georgia", "georgia.ttf", "Georgia"), ("times", "Times New Roman", "times.ttf", "'Times New Roman'"),
+    ("palatino", "Palatino", "pala.ttf", "'Palatino Linotype'"), ("garamond", "Garamond", "GARA.TTF", "Garamond"),
+    ("constantia", "Constantia", "constan.ttf", "Constantia"), ("cambria", "Cambria", "cambria.ttc", "Cambria"),
+    ("bookman", "Bookman Old Style", "BOOKOS.TTF", "'Bookman Old Style'"),
+    ("segoe", "Segoe UI", "segoeui.ttf", "'Segoe UI'"), ("calibri", "Calibri", "calibri.ttf", "Calibri"),
+    ("candara", "Candara", "Candara.ttf", "Candara"), ("verdana", "Verdana", "verdana.ttf", "Verdana"),
+    ("trebuchet", "Trebuchet MS", "trebuc.ttf", "'Trebuchet MS'"), ("tahoma", "Tahoma", "tahoma.ttf", "Tahoma"),
+]
+FONTS = {i: dict(label=lb, path=os.path.join(FONT_DIR, f), css=css) for i, lb, f, css in _FONTS
+         if os.path.isfile(os.path.join(FONT_DIR, f))}
+DEFAULT_FONT = "georgia"
 
 PANEL_W = 900                                   # left illustration panel
 # Theme palettes: one per Tailwind color (accent = its 300 shade). Everything else is derived from the accent:
@@ -47,6 +61,34 @@ FOCUS_Y = 400                                   # where the current sentence's f
 DEFAULT_IMAGE = os.path.join(ASSETS, "reader.png")
 
 
+def _mix(a, b, k):
+    """Blend colour a towards b by k (0..1)."""
+    return tuple(round(x + (y - x) * k) for x, y in zip(a, b))
+
+
+def _hex_rgb(v):
+    """'#rrggbb' -> (r, g, b), or None when empty / not a colour."""
+    v = str(v or "").strip().lstrip("#")
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4)) if len(v) == 6 and all(c in "0123456789abcdefABCDEF" for c in v) else None
+
+
+def _palette(theme, panel):
+    """Colours used on the right panel. With no custom panel colour this is the theme exactly as designed.
+    With one, the text colours are rebuilt from it so they stay readable (light text on dark, dark on light)."""
+    if not panel:
+        return dict(theme)
+    h, lum, _ = colorsys.rgb_to_hls(*(c / 255 for c in panel))
+    if lum < 0.55:   # dark panel: bright text
+        spoken, accent = _rgb(h, 0.95, 0.25), theme["accent"]
+    else:            # light panel: dark text, deeper accent
+        spoken = _rgb(h, 0.10, 0.25)
+        ah, _, asat = colorsys.rgb_to_hls(*(c / 255 for c in theme["accent"]))
+        accent = _rgb(ah, 0.32, max(asat, 0.5))
+    light = lum >= 0.55   # light panels need the faded text a bit stronger to stay readable
+    return dict(theme, bg=panel, spoken=spoken, accent=accent,
+                upcoming=_mix(spoken, panel, 0.30 if light else 0.38), dim=_mix(spoken, panel, 0.58 if light else 0.72))
+
+
 def _font(p, s):
     return ImageFont.truetype(p, s)
 
@@ -58,22 +100,41 @@ class SplitReader(Style):
     description = "Darkened artwork on the left with a player; the text scrolls sentence by sentence on the right."
     preview = "split_reader.png"
     options = [
-        {"key": "theme", "type": "theme", "label": "Theme color", "default": DEFAULT_THEME,
-         "choices": [{"id": k, "label": v["label"], "color": "#%02x%02x%02x" % v["accent"]} for k, v in THEMES.items()]},
-        {"key": "image", "type": "image", "label": "Left image",
-         "hint": "Portrait works best. It is cropped, darkened and tinted to the theme automatically. Leave empty for the default art."},
+        {"key": "theme", "type": "theme", "group": "Colors", "label": "Theme color", "default": DEFAULT_THEME,
+         "choices": [{"id": k, "label": v["label"], "color": "#%02x%02x%02x" % v["accent"],
+                      "bg": "#%02x%02x%02x" % v["bg"]} for k, v in THEMES.items()]},
+        {"key": "panel_color", "type": "color", "group": "Colors", "label": "Text panel color", "default": "",
+         "hint": "Background behind the text. Text colors adjust so they stay readable."},
+        {"key": "font", "type": "font", "group": "Text", "label": "Font", "default": DEFAULT_FONT,
+         "choices": [{"id": k, "label": v["label"], "css": v["css"]} for k, v in FONTS.items()]},
+        {"key": "image", "type": "image", "group": "Image", "label": "Picture",
+         "hint": "Portrait works best. It is cropped, darkened and tinted to the theme. Leave empty for the default art."},
+        {"key": "image_layout", "type": "choice", "group": "Image", "label": "Picture layout", "default": "full",
+         "choices": [{"id": "full", "label": "Full height"}, {"id": "card", "label": "Rounded card"}]},
+        {"key": "edge_shade", "type": "toggle", "group": "Image", "label": "Soft shade between picture and text",
+         "default": True, "show_if": {"key": "image_layout", "value": "full"}},
+        {"key": "card_padding", "type": "range", "group": "Image", "label": "Space around the picture", "default": 56,
+         "min": 16, "max": 140, "step": 4, "unit": "px", "show_if": {"key": "image_layout", "value": "card"}},
+        {"key": "card_radius", "type": "range", "group": "Image", "label": "Corner roundness", "default": 40,
+         "min": 0, "max": 140, "step": 4, "unit": "px", "show_if": {"key": "image_layout", "value": "card"}},
     ]
 
     def __init__(self, words, duration, options):
         super().__init__(words, duration, options)
         self.t = THEMES.get(options.get("theme"), THEMES[DEFAULT_THEME])
-        self.cap_font = _font(SERIF, FONT_SIZE)
+        self.c = _palette(self.t, _hex_rgb(options.get("panel_color")))   # right-panel colours
+        self.cap_font = _font(FONTS.get(options.get("font"), FONTS[DEFAULT_FONT])["path"], FONT_SIZE)
+        self.card = options.get("image_layout") == "card"
+        self.shade = bool(options.get("edge_shade", True))
+        self.pad = int(min(max(options.get("card_padding", 56), 16), 140))
+        self.radius = int(min(max(options.get("card_radius", 40), 0), 140))
         self.base = self._build_base(options.get("image") or DEFAULT_IMAGE)
         self.sents = self._layout()
         self.mask = self._fade_mask()
 
     # ---- static background
-    def _build_base(self, image_path):
+    def _art(self, image_path, w, h):
+        """The picture cropped to w x h (cover), recolored for the theme, darkened and vignetted, as float RGB."""
         im = Image.open(image_path).convert("RGB")
         if image_path == DEFAULT_IMAGE and self.t is not THEMES[DEFAULT_THEME]:
             # recolor the bundled purple art to the theme: rotate the hue, scale the saturation
@@ -83,25 +144,42 @@ class SplitReader(Style):
             hsv[..., 0] = (hsv[..., 0].astype(np.int16) + shift) % 256
             hsv[..., 1] = (hsv[..., 1] * self.t["sat"]).astype(np.uint8)
             im = Image.fromarray(hsv, "HSV").convert("RGB")
-        r = PANEL_W / im.width
-        im = im.resize((PANEL_W, max(H, round(im.height * r))), Image.LANCZOS)
-        top = min(max(0, round(im.height * 0.34)), im.height - H)
-        a = np.asarray(im.crop((0, top, PANEL_W, top + H))).astype(np.float32)
+        r = max(w / im.width, h / im.height)
+        im = im.resize((max(w, round(im.width * r)), max(h, round(im.height * r))), Image.LANCZOS)
+        left = (im.width - w) // 2
+        top = min(max(0, round(im.height * 0.34)), im.height - h)
+        a = np.asarray(im.crop((left, top, left + w, top + h))).astype(np.float32)
         a *= 0.42                                                    # darker shade
         if self.t is THEMES[DEFAULT_THEME]:
             a = a * np.array([0.92, 0.88, 1.0], np.float32)          # keep the default art cool purple
-        yy, xx = np.mgrid[0:H, 0:PANEL_W]
-        vig = 1.0 - 0.55 * (((xx - PANEL_W * 0.5) / (PANEL_W * 0.75)) ** 2 + ((yy - H * 0.55) / (H * 0.8)) ** 2)
-        a *= np.clip(vig, 0.3, 1)[..., None]
-        fade = np.clip((PANEL_W - xx) / 160, 0, 1)[..., None]       # blend right edge into the text panel
-        a = a * fade + np.array(self.t["bg"], np.float32) * (1 - fade)
-        a += np.random.default_rng(1).normal(0, 1.6, a.shape)
-        base = Image.new("RGB", (W, H), self.t["bg"])
-        base.paste(Image.fromarray(np.clip(a, 0, 255).astype(np.uint8)), (0, 0))
+        yy, xx = np.mgrid[0:h, 0:w]
+        vig = 1.0 - 0.55 * (((xx - w * 0.5) / (w * 0.75)) ** 2 + ((yy - h * 0.55) / (h * 0.8)) ** 2)
+        return a * np.clip(vig, 0.3, 1)[..., None]
+
+    def _build_base(self, image_path):
+        bg = np.array(self.c["bg"], np.float32)
+        base = Image.new("RGB", (W, H), self.c["bg"])
+        if self.card:
+            # rounded picture with space around it, on the same background as the text panel
+            w, h = PANEL_W - 2 * self.pad, H - 2 * self.pad
+            a = self._art(image_path, w, h) + np.random.default_rng(1).normal(0, 1.6, (h, w, 3))
+            art = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+            k = 4                                                     # draw the mask larger, shrink: smooth corners
+            m = Image.new("L", (w * k, h * k), 0)
+            ImageDraw.Draw(m).rounded_rectangle((0, 0, w * k - 1, h * k - 1), radius=self.radius * k, fill=255)
+            base.paste(art, (self.pad, self.pad), m.resize((w, h), Image.LANCZOS))
+        else:
+            a = self._art(image_path, PANEL_W, H)
+            if self.shade:                                            # blend the right edge into the text panel
+                xx = np.arange(PANEL_W, dtype=np.float32)[None, :]
+                fade = np.clip((PANEL_W - xx) / 160, 0, 1)[..., None]
+                a = a * fade + bg * (1 - fade)
+            a += np.random.default_rng(1).normal(0, 1.6, a.shape)
+            base.paste(Image.fromarray(np.clip(a, 0, 255).astype(np.uint8)), (0, 0))
         g = np.asarray(base).astype(np.float32)
         yy, xx = np.mgrid[0:H, PANEL_W:W]
         glow = np.clip(1 - np.sqrt(((xx - 1400) / 700) ** 2 + ((yy - 480) / 520) ** 2), 0, 1) ** 2
-        g[:, PANEL_W:] += glow[..., None] * (np.array(self.t["accent"], np.float32) * 0.07)
+        g[:, PANEL_W:] += glow[..., None] * (np.array(self.c["accent"], np.float32) * 0.07 * (1 if sum(self.c["bg"]) < 400 else -1))
         return Image.fromarray(np.clip(g, 0, 255).astype(np.uint8)).convert("RGBA")
 
     def _fade_mask(self):
@@ -155,13 +233,13 @@ class SplitReader(Style):
             for w in s["words"]:
                 y = w["y"] - scroll + FOCUS_Y
                 if i != k:
-                    col = self.t["dim"]
+                    col = self.c["dim"]
                 elif w["start"] <= t < max(w["end"], w["start"] + 0.12):
-                    col = self.t["accent"]
+                    col = self.c["accent"]
                 elif w["start"] <= t:
-                    col = self.t["spoken"]
+                    col = self.c["spoken"]
                 else:
-                    col = self.t["upcoming"]
+                    col = self.c["upcoming"]
                 d.text((w["x"], y), w["w"], font=self.cap_font, fill=col + (255,))
         a = np.asarray(layer).copy()
         a[..., 3] = (a[..., 3] * self.mask).astype(np.uint8)       # fade the top/bottom of the text column

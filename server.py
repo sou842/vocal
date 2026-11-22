@@ -629,6 +629,32 @@ def video_worker():
 
 
 # ------------------------------------------------------------------ HTTP
+def parse_video_options(style, opts_in):
+    """Keep only the options the style declares and check each value (theme/font from the list, colour as #rrggbb)."""
+    opts_in = opts_in if isinstance(opts_in, dict) else {}
+    options = {}
+    for o in video.STYLES[style].options:
+        val = opts_in.get(o["key"], o.get("default"))
+        if o["type"] in ("theme", "font", "choice"):
+            if val not in {c["id"] for c in o["choices"]}:
+                raise ApiError(400, f"Unknown value for {o['label'].lower()}.")
+            options[o["key"]] = val
+        elif o["type"] == "toggle":
+            options[o["key"]] = bool(val)
+        elif o["type"] == "range":
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                raise ApiError(400, f"{o['label']} must be a number.")
+            options[o["key"]] = min(max(num, o["min"]), o["max"])
+        elif o["type"] == "color":
+            val = str(val or "")
+            if val and not re.fullmatch(r"#[0-9a-fA-F]{6}", val):
+                raise ApiError(400, "Pick a valid color.")
+            options[o["key"]] = val
+    return options
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "VocalStudio/1.0"
     protocol_version = "HTTP/1.1"
@@ -983,6 +1009,42 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "Voice not found.")
             return self.send_json({"ok": True})
 
+        if path == "/api/video/preview":     # one still frame with the chosen options (live preview in the dialog)
+            body = self.read_json()
+            style = str(body.get("style") or "")
+            if style not in video.STYLES:
+                raise ApiError(400, "Pick a video style.")
+            options = parse_video_options(style, body.get("options"))
+            tmp_img = None
+            try:
+                if body.get("image"):
+                    try:
+                        raw = base64.b64decode(str(body["image"]), validate=True)
+                        if len(raw) > MAX_IMAGE_BYTES:
+                            raise ValueError
+                        from PIL import Image
+                        with Image.open(io.BytesIO(raw)) as im:
+                            im.verify()
+                    except Exception:
+                        raise ApiError(400, "The image could not be read.")
+                    tmp_img = os.path.join(VOICES, uuid.uuid4().hex + ".img")
+                    with open(tmp_img, "wb") as fh:
+                        fh.write(raw)
+                    options["image"] = tmp_img
+                try:
+                    frame = video.preview_frame(style, options, str(body.get("text") or "")[:1500])
+                except ImportError:
+                    raise ApiError(500, "Video creation needs extra packages (see the README).")
+                out = io.BytesIO()
+                frame.resize((1280, 720)).save(out, "JPEG", quality=88)
+                return self.send_body(200, out.getvalue(), "image/jpeg")
+            finally:
+                if tmp_img:
+                    try:
+                        os.remove(tmp_img)
+                    except OSError:
+                        pass
+
         if path == "/api/video":
             body = self.read_json()
             project = resolve_project(body.get("project"))
@@ -992,14 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
             style = str(body.get("style") or "")
             if style not in video.STYLES:
                 raise ApiError(400, "Pick a video style.")
-            opts_in = body.get("options") if isinstance(body.get("options"), dict) else {}
-            options = {}
-            for o in video.STYLES[style].options:     # only options the style declares are accepted
-                if o["type"] == "theme":
-                    val = opts_in.get(o["key"], o["default"])
-                    if val not in {c["id"] for c in o["choices"]}:
-                        raise ApiError(400, "Unknown theme color.")
-                    options[o["key"]] = val
+            options = parse_video_options(style, body.get("options"))
             text = str(body.get("text") or "").strip()
             if not text:
                 raise ApiError(400, "Enter the text that was spoken in this audio.")

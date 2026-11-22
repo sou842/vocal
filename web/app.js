@@ -861,7 +861,7 @@ function renderEngine(){
 const PILL = {
   local:    {cls: 'badge hover:bg-accent', text: 'Local CPU', pulse: false},
   checking: {cls: 'badge hover:bg-accent', text: 'Colab GPU · Checking...', pulse: true},
-  online:   {cls: 'badge hover:bg-accent text-success border-success/40', text: 'Colab GPU · Connected', pulse: false},
+  online:   {cls: 'badge hover:bg-accent text-success border-success/40', text: 'GPU', pulse: false},
   offline:  {cls: 'badge hover:bg-accent text-destructive border-destructive/40', text: 'Colab GPU · Offline', pulse: false},
 };
 let colabState = 'local', colabCheckSeq = 0, colabLoaded = false;
@@ -1058,6 +1058,86 @@ const videoUrl = (project, file) => '/projects/' + encodeURIComponent(project) +
 let vidStyles = null, vidImage = null, vidStyleId = store.get('videoStyle') || '', vidPollId = null, vidScriptSeq = 0;
 let vidThemes = {};   // style id -> chosen theme id
 try { vidThemes = JSON.parse(store.get('videoThemes') || '{}') || {}; } catch (e){ vidThemes = {}; }
+let vidVals = {};     // style id -> {option key: value} for the color and font options
+try { vidVals = JSON.parse(store.get('videoVals') || '{}') || {}; } catch (e){ vidVals = {}; }
+const PANEL_SWATCHES = ['#0d0b1a', '#111111', '#1e293b', '#3b0764', '#f5f1e8', '#ffffff'];
+
+/* the options the user has chosen for a style, in the form the server expects */
+function collectVidOptions(st){
+  const options = {};
+  ((st && st.options) || []).forEach(o => {
+    const v = (vidVals[st.id] || {})[o.key];
+    if (o.type === 'theme'){
+      const t = vidThemes[st.id];
+      options[o.key] = t && o.choices.some(c => c.id === t) ? t : o.default;
+    } else if (o.type === 'font' || o.type === 'choice'){
+      options[o.key] = o.choices.some(c => c.id === v) ? v : (o.choices.some(c => c.id === o.default) ? o.default : o.choices[0].id);
+    } else if (o.type === 'color'){
+      options[o.key] = /^#[0-9a-f]{6}$/i.test(v || '') ? v : '';
+    } else if (o.type === 'toggle'){
+      options[o.key] = typeof v === 'boolean' ? v : !!o.default;
+    } else if (o.type === 'range'){
+      options[o.key] = Number.isFinite(v) ? Math.min(Math.max(v, o.min), o.max) : o.default;
+    }
+  });
+  return options;
+}
+function setVidVal(st, key, val){
+  (vidVals[st.id] = vidVals[st.id] || {})[key] = val;
+  store.set('videoVals', JSON.stringify(vidVals));
+}
+/* a theme choice of a style (it carries the theme's default panel color as `bg`) */
+const vidStyleThemes = (st, id) => {
+  const o = ((st && st.options) || []).find(x => x.type === 'theme');
+  return o && o.choices.find(c => c.id === id);
+};
+
+/* live preview: the server draws one frame with the chosen options (and the start of the entered text) */
+let vidPreviewTimer = null, vidPreviewSeq = 0, vidPreviewAbort = null, vidPreviewUrl = null, vidShrunk = null;
+function shrinkImage(file){   // small copy for the preview only (the real video uses the original)
+  if (vidShrunk && vidShrunk.file === file) return Promise.resolve(vidShrunk.b64);
+  return createImageBitmap(file).then(bm => {
+    const k = Math.min(1, 1600 / Math.max(bm.width, bm.height));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bm.width * k)); c.height = Math.max(1, Math.round(bm.height * k));
+    c.getContext('2d').drawImage(bm, 0, 0, c.width, c.height);
+    return new Promise(res => c.toBlob(b => res(b), 'image/jpeg', 0.85));
+  }).then(blob => readB64(blob)).then(b64 => (vidShrunk = {file, b64}, b64));
+}
+function scheduleVidPreview(delay = 350){
+  clearTimeout(vidPreviewTimer);
+  vidPreviewTimer = setTimeout(refreshVidPreview, delay);
+}
+async function refreshVidPreview(){
+  const st = vidStyles && vidStyles.find(x => x.id === vidStyleId);
+  if (!st || !$('videoDialog').open) return;
+  const seq = ++vidPreviewSeq;
+  if (vidPreviewAbort) vidPreviewAbort.abort();
+  const ctl = vidPreviewAbort = new AbortController();
+  $('vidPreviewBusy').hidden = false; $('vidPreviewNote').textContent = '';
+  try {
+    const body = {style: st.id, options: collectVidOptions(st), text: $('vidText').value.trim().slice(0, 1200)};
+    if (vidImage) body.image = await shrinkImage(vidImage);
+    const r = await fetch('/api/video/preview', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                                 body: JSON.stringify(body), signal: ctl.signal});
+    if (!r.ok){
+      let msg = 'Could not make the preview.';
+      try { msg = (await r.json()).error || msg; } catch (e){ /* keep */ }
+      throw new Error(msg);
+    }
+    const url = URL.createObjectURL(await r.blob());
+    if (seq !== vidPreviewSeq){ URL.revokeObjectURL(url); return; }
+    if (vidPreviewUrl) URL.revokeObjectURL(vidPreviewUrl);
+    vidPreviewUrl = url;
+    $('vidPreview').src = url; $('vidPreview').hidden = false; $('vidPreviewEmpty').hidden = true;
+  } catch (e){
+    if (e.name === 'AbortError' || seq !== vidPreviewSeq) return;
+    $('vidPreviewNote').textContent = e.message;
+    if (!vidPreviewUrl) $('vidPreviewEmpty').textContent = 'No preview available.';
+  } finally {
+    if (seq === vidPreviewSeq) $('vidPreviewBusy').hidden = true;
+  }
+}
 
 const readB64 = file => new Promise((res, rej) => {
   const r = new FileReader();
@@ -1066,45 +1146,149 @@ const readB64 = file => new Promise((res, rej) => {
   r.readAsDataURL(file);
 });
 
+const VSEG_ON = 'bg-background font-medium shadow-sm', VSEG_OFF = 'text-muted-foreground hover:text-foreground';
+
+function optionHtml(st, o, vals){
+  const cur = vals[o.key], vv = (vidVals[st.id] || {})[o.key];
+  if (o.type === 'theme') return `
+    <div>
+      <div class="mb-2 flex justify-between"><span class="label">${esc(o.label)}</span><span id="vidThemeName" class="hint">${esc((o.choices.find(c => c.id === cur) || {}).label || '')}</span></div>
+      <div class="flex flex-wrap gap-2.5" role="radiogroup" aria-label="${esc(o.label)}">
+        ${o.choices.map(c => `<button type="button" role="radio" aria-checked="${c.id === cur}" aria-label="${esc(c.label)}" title="${esc(c.label)}" data-theme="${esc(c.id)}" data-tlabel="${esc(c.label)}"
+           class="size-8 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${c.id === cur ? 'border-foreground ring-2 ring-offset-2 ring-offset-card ring-foreground/40' : 'border-transparent'}"
+           style="background:${esc(c.color)}"></button>`).join('')}
+      </div>
+    </div>`;
+  if (o.type === 'color'){
+    const tc = (vidStyleThemes(st, vals.theme) || {}).bg || '#000000';
+    return `
+    <div>
+      <div class="mb-2 flex justify-between"><span class="label">${esc(o.label)}</span><span id="vidColorName" class="hint">${cur ? esc(cur) : 'Theme default'}</span></div>
+      <div class="flex flex-wrap items-center gap-2">
+        <input type="color" data-color="${esc(o.key)}" value="${esc(cur || tc)}" aria-label="${esc(o.label)}" class="h-8 w-12 cursor-pointer rounded-md border bg-transparent p-0.5">
+        ${PANEL_SWATCHES.map(c => `<button type="button" data-swatch="${c}" data-color-key="${esc(o.key)}" aria-label="${c}" title="${c}" class="size-6 cursor-pointer rounded-full border-2 border-border transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" style="background:${c}"></button>`).join('')}
+        <button type="button" data-color-reset="${esc(o.key)}" class="btn btn-outline btn-sm">Theme default</button>
+      </div>
+      ${o.hint ? `<p class="hint mt-1.5">${esc(o.hint)}</p>` : ''}
+    </div>`;
+  }
+  if (o.type === 'font'){
+    const css = (o.choices.find(c => c.id === cur) || {}).css || 'inherit';
+    return `
+    <div>
+      <label class="label mb-2 block" for="vidOpt_${esc(o.key)}">${esc(o.label)}</label>
+      <select id="vidOpt_${esc(o.key)}" data-font="${esc(o.key)}" class="input" style="font-family:${esc(css)}">
+        ${o.choices.map(c => `<option value="${esc(c.id)}" style="font-family:${esc(c.css)}" ${c.id === cur ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}
+      </select>
+    </div>`;
+  }
+  if (o.type === 'choice') return `
+    <div>
+      <div class="label mb-2">${esc(o.label)}</div>
+      <div class="flex w-full rounded-lg border bg-muted p-0.5" role="radiogroup" aria-label="${esc(o.label)}">
+        ${o.choices.map(c => `<button type="button" role="radio" aria-checked="${c.id === cur}" data-choice-key="${esc(o.key)}" data-choice="${esc(c.id)}"
+           class="flex-1 cursor-pointer rounded-md px-3 py-1.5 text-sm transition-colors focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${c.id === cur ? VSEG_ON : VSEG_OFF}">${esc(c.label)}</button>`).join('')}
+      </div>
+    </div>`;
+  if (o.type === 'toggle') return `
+    <label class="flex cursor-pointer items-center justify-between gap-3">
+      <span class="label">${esc(o.label)}</span>
+      <input type="checkbox" role="switch" data-toggle="${esc(o.key)}" ${cur ? 'checked' : ''}
+        class="relative h-5 w-9 shrink-0 cursor-pointer appearance-none rounded-full bg-border transition-colors checked:bg-primary before:absolute before:left-0.5 before:top-0.5 before:size-4 before:rounded-full before:bg-background before:transition-transform checked:before:translate-x-4 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
+    </label>`;
+  if (o.type === 'range') return `
+    <div>
+      <div class="mb-2 flex justify-between"><label class="label" for="vidOpt_${esc(o.key)}">${esc(o.label)}</label><span class="hint tabular-nums" data-range-val="${esc(o.key)}">${cur}${esc(o.unit ? ' ' + o.unit : '')}</span></div>
+      <input id="vidOpt_${esc(o.key)}" type="range" data-range="${esc(o.key)}" min="${o.min}" max="${o.max}" step="${o.step || 1}" value="${cur}" class="w-full">
+    </div>`;
+  if (o.type === 'image') return `
+    <div>
+      <div class="mb-2 flex justify-between"><label class="label" for="vidOpt_${esc(o.key)}">${esc(o.label)}</label><span class="hint">Optional</span></div>
+      <input id="vidOpt_${esc(o.key)}" data-opt="${esc(o.key)}" type="file" accept="image/png,image/jpeg,image/webp" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
+      <p class="hint mt-1.5">${esc(o.hint || '')}</p>
+    </div>`;
+  return '';
+}
+
 function renderVideoStyles(){
-  const box = $('vidStyles');
-  box.innerHTML = vidStyles.map(st => `
-    <button type="button" data-style="${esc(st.id)}" class="cursor-pointer overflow-hidden rounded-lg border text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${st.id === vidStyleId ? 'border-primary ring-2 ring-primary' : ''}" aria-pressed="${st.id === vidStyleId}">
-      ${st.preview ? `<img class="aspect-video w-full object-cover" src="${esc(st.preview)}" alt="">` : ''}
-      <div class="p-3"><div class="font-medium">${esc(st.name)}</div><div class="hint">${esc(st.description)}</div></div>
+  $('vidStyles').innerHTML = vidStyles.map(st => `
+    <button type="button" data-style="${esc(st.id)}" class="flex cursor-pointer items-center gap-3 rounded-lg border p-2 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${st.id === vidStyleId ? 'border-primary ring-2 ring-primary' : ''}" aria-pressed="${st.id === vidStyleId}">
+      ${st.preview ? `<img class="aspect-video w-28 shrink-0 rounded-md object-cover" src="${esc(st.preview)}" alt="">` : ''}
+      <span class="min-w-0"><span class="block font-medium">${esc(st.name)}</span><span class="hint block">${esc(st.description)}</span></span>
     </button>`).join('');
-  box.querySelectorAll('[data-style]').forEach(b => b.onclick = () => { vidStyleId = b.dataset.style; store.set('videoStyle', vidStyleId); vidImage = null; renderVideoStyles(); });
+  $('vidStyles').querySelectorAll('[data-style]').forEach(b => b.onclick = () => { vidStyleId = b.dataset.style; store.set('videoStyle', vidStyleId); vidImage = null; renderVideoStyles(); });
   const st = vidStyles.find(x => x.id === vidStyleId);
-  $('vidOptions').innerHTML = ((st && st.options) || []).map(o => {
-    if (o.type === 'theme'){
-      const cur = vidThemes[st.id] && o.choices.some(c => c.id === vidThemes[st.id]) ? vidThemes[st.id] : o.default;
-      return `<div>
-        <div class="mb-2 flex justify-between"><span class="label">${esc(o.label)}</span><span id="vidThemeName" class="hint">${esc((o.choices.find(c => c.id === cur) || {}).label || '')}</span></div>
-        <div class="flex flex-wrap gap-2.5" role="radiogroup" aria-label="${esc(o.label)}">
-          ${o.choices.map(c => `<button type="button" role="radio" aria-checked="${c.id === cur}" aria-label="${esc(c.label)}" title="${esc(c.label)}" data-theme="${esc(c.id)}" data-tlabel="${esc(c.label)}"
-             class="size-9 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${c.id === cur ? 'border-foreground ring-2 ring-offset-2 ring-offset-card ring-foreground/40' : 'border-transparent'}"
-             style="background:${esc(c.color)}"></button>`).join('')}
-        </div></div>`;
-    }
-    if (o.type === 'image') return `
-      <div>
-        <div class="mb-2 flex justify-between"><label class="label" for="vidOpt_${esc(o.key)}">${esc(o.label)}</label><span class="hint">Optional</span></div>
-        <input id="vidOpt_${esc(o.key)}" data-opt="${esc(o.key)}" type="file" accept="image/png,image/jpeg,image/webp" class="w-full rounded-md border border-dashed bg-muted p-1.5 text-xs file:mr-2 file:rounded-sm file:border file:bg-background file:px-2.5 file:py-1 file:text-xs file:font-medium">
-        <p class="hint mt-1.5">${esc(o.hint || '')}</p>
-      </div>`;
-    return '';
-  }).join('');
-  $('vidOptions').querySelectorAll('[data-opt]').forEach(i => i.onchange = () => { vidImage = i.files[0] || null; });
-  $('vidOptions').querySelectorAll('[data-theme]').forEach(b => b.onclick = () => {
+  const vals = collectVidOptions(st), box = $('vidOptions');
+  const groups = [];
+  ((st && st.options) || []).forEach(o => {
+    const g = o.group || 'Options';
+    (groups.find(x => x.name === g) || (groups.push({name: g, opts: []}), groups[groups.length - 1])).opts.push(o);
+  });
+  box.innerHTML = groups.map(g => `
+    <details open class="group rounded-lg border">
+      <summary class="flex cursor-pointer list-none items-center justify-between px-4 py-2.5 text-sm font-semibold select-none [&::-webkit-details-marker]:hidden">
+        ${esc(g.name)}<span class="text-muted-foreground transition-transform group-open:rotate-180">${lu('chevron-down')}</span>
+      </summary>
+      <div class="space-y-4 border-t px-4 py-4">
+        ${g.opts.map(o => `<div data-wrap="${esc(o.key)}" ${!o.show_if || vals[o.show_if.key] === o.show_if.value ? '' : 'hidden'}>${optionHtml(st, o, vals)}</div>`).join('')}
+      </div>
+    </details>`).join('');
+
+  const changed = () => {   // an option changed: show/hide the options that depend on it, then refresh the preview
+    const v = collectVidOptions(st);
+    st.options.filter(o => o.show_if).forEach(o => {
+      box.querySelector(`[data-wrap="${o.key}"]`).hidden = v[o.show_if.key] !== o.show_if.value;
+    });
+    scheduleVidPreview();
+  };
+  const setColor = (key, val) => {
+    setVidVal(st, key, val);
+    box.querySelector(`[data-color="${key}"]`).value = val || ((vidStyleThemes(st, collectVidOptions(st).theme) || {}).bg || '#000000');
+    $('vidColorName').textContent = val || 'Theme default';
+    changed();
+  };
+  box.querySelectorAll('[data-color]').forEach(i => i.oninput = () => setColor(i.dataset.color, i.value));
+  box.querySelectorAll('[data-swatch]').forEach(b => b.onclick = () => setColor(b.dataset.colorKey, b.dataset.swatch));
+  box.querySelectorAll('[data-color-reset]').forEach(b => b.onclick = () => setColor(b.dataset.colorReset, ''));
+  box.querySelectorAll('[data-font]').forEach(sel => sel.onchange = () => {
+    setVidVal(st, sel.dataset.font, sel.value);
+    sel.style.fontFamily = (sel.selectedOptions[0] || {}).style.fontFamily || 'inherit';
+    changed();
+  });
+  box.querySelectorAll('[data-choice]').forEach(b => b.onclick = () => {
+    setVidVal(st, b.dataset.choiceKey, b.dataset.choice);
+    box.querySelectorAll(`[data-choice-key="${b.dataset.choiceKey}"]`).forEach(x => {
+      const on = x === b;
+      x.setAttribute('aria-checked', on);
+      VSEG_ON.split(' ').forEach(c => x.classList.toggle(c, on));
+      VSEG_OFF.split(' ').forEach(c => x.classList.toggle(c, !on));
+    });
+    changed();
+  });
+  box.querySelectorAll('[data-toggle]').forEach(i => i.onchange = () => { setVidVal(st, i.dataset.toggle, i.checked); changed(); });
+  box.querySelectorAll('[data-range]').forEach(i => {
+    const o = st.options.find(x => x.key === i.dataset.range);
+    i.oninput = () => {
+      setVidVal(st, o.key, Number(i.value));
+      box.querySelector(`[data-range-val="${o.key}"]`).textContent = i.value + (o.unit ? ' ' + o.unit : '');
+      changed();
+    };
+  });
+  box.querySelectorAll('[data-opt]').forEach(i => i.onchange = () => { vidImage = i.files[0] || null; scheduleVidPreview(100); });
+  box.querySelectorAll('[data-theme]').forEach(b => b.onclick = () => {
     vidThemes[st.id] = b.dataset.theme; store.set('videoThemes', JSON.stringify(vidThemes));
-    $('vidOptions').querySelectorAll('[data-theme]').forEach(x => {
+    box.querySelectorAll('[data-theme]').forEach(x => {
       const on = x === b;
       x.setAttribute('aria-checked', on);
       x.classList.toggle('border-foreground', on); x.classList.toggle('border-transparent', !on);
       ['ring-2', 'ring-offset-2', 'ring-offset-card', 'ring-foreground/40'].forEach(c => x.classList.toggle(c, on));
     });
     $('vidThemeName').textContent = b.dataset.tlabel;
+    const ci = box.querySelector('[data-color]');   // the picker shows the theme's panel color until changed
+    if (ci && !(vidVals[st.id] || {}).panel_color) ci.value = (vidStyleThemes(st, b.dataset.theme) || {}).bg || ci.value;
+    scheduleVidPreview(150);
   });
+  scheduleVidPreview(150);
 }
 
 async function loadVidScript(file){
@@ -1117,6 +1301,7 @@ async function loadVidScript(file){
     $('vidText').value = r.text || '';
     $('vidTextHint').textContent = r.text ? 'Filled in from the text this audio was generated from.'
       : 'This audio was made before scripts were saved. Paste its exact text.';
+    scheduleVidPreview(100);
   } catch (e){ /* leave empty */ }
 }
 
@@ -1138,7 +1323,8 @@ async function openVideoDialog(file){
   loadVidScript($('vidAudio').value);
 }
 $('vidAudio').onchange = () => loadVidScript($('vidAudio').value);
-$('vidCancel').onclick = () => $('videoDialog').close();
+$('vidText').onchange = () => scheduleVidPreview(100);
+$('vidCancel').onclick = $('vidClose').onclick = () => $('videoDialog').close();
 $('newVideoBtn').onclick = () => openVideoDialog();
 $('videoForm').onsubmit = async ev => {
   ev.preventDefault();
@@ -1148,11 +1334,7 @@ $('videoForm').onsubmit = async ev => {
   $('vidGo').disabled = true;
   try {
     const st = vidStyles.find(x => x.id === vidStyleId);
-    const options = {};
-    ((st && st.options) || []).filter(o => o.type === 'theme').forEach(o => {
-      const t = vidThemes[st.id];
-      options[o.key] = t && o.choices.some(c => c.id === t) ? t : o.default;
-    });
+    const options = collectVidOptions(st);
     const body = {project: curProject(), file: $('vidAudio').value, style: vidStyleId, text, options};
     if (vidImage) body.image = await readB64(vidImage);
     const j = await api.post('/api/video', body);
